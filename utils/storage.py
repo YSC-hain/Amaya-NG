@@ -105,14 +105,15 @@ def get_pinned_content():
 DEFAULT_VISIBLE_FILES = ["routine.json", "plan.md", "user_profile.md", "current_goals.md"]
 
 def get_pending_jobs_summary():
-    """将挂起的闹钟任务转换为人类可读的摘要"""
+    """将挂起的闹钟任务转换为较为可读的摘要"""
     jobs = load_json("pending_jobs", default=[])
     if not jobs:
         return "无挂起的提醒任务。"
 
-    summary = []
+    summary = ['以下是提醒任务列表']
     now = time.time()
     for job in jobs:
+        id = job.get('id', '')
         run_at = job.get('run_at', 0)
         prompt = job.get('prompt', '未知任务')
 
@@ -124,7 +125,7 @@ def get_pending_jobs_summary():
             if diff > 3600:
                 dt = datetime.fromtimestamp(run_at)
                 time_str = dt.strftime("%m-%d %H:%M")
-            summary.append(f"- [提醒] {prompt} (执行时间: {time_str})")
+            summary.append(f"- (ID: {id}) {prompt} (执行时间: {time_str})")
 
     return "\n".join(summary) if summary else "无挂起的提醒任务。"
 
