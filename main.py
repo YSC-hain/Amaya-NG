@@ -4,13 +4,13 @@ import json
 import logging
 import time
 
-from telegram import Update
-from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, filters
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, filters, CallbackQueryHandler
 
 import config
 from core.agent import amaya
 from core.tools import SYS_EVENT_FILE
-from utils.storage import load_json, save_json
+from utils.storage import load_json, save_json, get_pending_jobs_summary
 
 
 # --- 设置日志 ---
@@ -43,17 +43,44 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(
         f"你好，{user.first_name}。\n"
-        f"我是 Silent Partner 原型机。\n"
+        f"我是 Amaya 原型机。\n"
         f"你的 ID 是: `{chat_id}` (已记录)\n\n"
         "功能测试：\n"
         "1. 发送 /ping 测试延迟\n"
-        "2. 发送 /remind 5 测试定时任务 (5秒后提醒)",
+        "2. 发送 /reminders 查看挂起的提醒任务",
         parse_mode='Markdown'
     )
 
 async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """测试基本响应"""
     await update.message.reply_text("Pong! 系统在线。")  # ToDo: 可以在这放置一些系统的基础信息
+
+async def reminders(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """查看挂起的提醒任务"""
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+    summary = get_pending_jobs_summary()
+    keyboard = [
+        [InlineKeyboardButton("刷新", callback_data='refresh_reminders')],
+        [InlineKeyboardButton("关闭", callback_data='close_reminders')]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text(summary, reply_markup=reply_markup)
+
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """处理按钮回调"""
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == 'refresh_reminders':
+        summary = get_pending_jobs_summary()
+        keyboard = [
+            [InlineKeyboardButton("刷新", callback_data='refresh_reminders')],
+            [InlineKeyboardButton("关闭", callback_data='close_reminders')]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text(text=summary, reply_markup=reply_markup)
+    elif query.data == 'close_reminders':
+        await query.delete_message()
 
 async def chat_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
@@ -74,6 +101,9 @@ async def chat_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # 1. 调用大脑
     response_text = await amaya.chat(user_text)
+
+    # 再次发送typing以确保持续
+    await context.bot.send_chat_action(chat_id=chat_id, action="typing")
 
     logger.info(f"Amaya 回复: {response_text[:50]}...")
 
@@ -98,6 +128,9 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
     response_text = await amaya.chat(caption, image_bytes=bytes(image_bytes))
+
+    # 再次发送typing以确保持续
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
 
     try:
         await update.message.reply_text(response_text, parse_mode='Markdown')
@@ -193,7 +226,9 @@ async def check_system_events(context: ContextTypes.DEFAULT_TYPE):
                     logger.info(f"已调度并持久化新任务: '{prompt}' ({int(delay)}s后)")
             elif event.get("type") == "clear_reminder":
                 reminder_id = event["reminder_id"]
-                context.job_queue.remove_job(reminder_id)
+                jobs = context.job_queue.get_jobs_by_name(reminder_id)
+                if jobs:
+                    jobs[0].schedule_removal()
                 update_pending_jobs(reminder_id, 0, "", remove=True)
                 logger.info(f"已清除提醒任务: {reminder_id}")
     except Exception as e:
@@ -232,6 +267,10 @@ if __name__ == '__main__':
     # 注册命令 (Command Handlers)
     application.add_handler(CommandHandler('start', start))
     application.add_handler(CommandHandler('ping', ping))
+    application.add_handler(CommandHandler('reminders', reminders))
+
+    # 注册回调查询处理器
+    application.add_handler(CallbackQueryHandler(handle_callback))
 
     # 注册消息处理器 (Message Handler) - 必须放在命令之后
     # 过滤掉命令，只处理纯文本
