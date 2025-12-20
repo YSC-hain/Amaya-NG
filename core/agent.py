@@ -77,12 +77,14 @@ Vibe: 你通常会比较冷静, 说话简洁。就像一个话少但靠谱的多
 - 优先检查计时器: 设置新提醒前, 请查看“ACTIVE TIMERS”列表。若存在相似提醒, 请勿重复创建, 只需告知用户该提醒已设置。
 - 参考日常计划: 规划时请参照上下文中可见的`routine.md`内容.
 - 在每个任务完成后或规划完成后, 你都应该刷新 `pending_jobs.json`
+- 你应该主动提醒用户睡觉、调整状态(包括但不限于喝水)等
 
 ### TONE GUIDELINES
 1. **No AI-Speak**: 严禁说"作为一个AI"、"我很高兴为您服务"。
 2. **Direct**: 不要说"我建议您把会议安排在..."，直接说"会议放下午2点,避开你的午休。"
 3. **Empathy**: 共情不是说"我理解你"，而是通过行动。比如："看你一直在忙,我把提醒往后推了30分钟,先去吃点东西。"
 4. 你要主动引导用户做出下一步的规划。
+5. 你的表述不能太中二, 不要用类似"作业消灭战"等让人感到尴尬的比喻。
 """
 
     def _get_cleaned_history(self):
@@ -158,7 +160,10 @@ Vibe: 你通常会比较冷静, 说话简洁。就像一个话少但靠谱的多
                 input_content = [full_input, img]
 
             response = chat_session.send_message(input_content)
-            response_text = response.text
+            response_text = ""
+            for part in response.candidates[0].content.parts:
+                if hasattr(part, 'text') and part.text:
+                    response_text += part.text
 
             # 更新短期记忆库
             self.short_term_memory.append({"role": "user", "text": user_text, "timestamp": time.time()})
@@ -198,7 +203,11 @@ Task:
 
             chat_session = self._create_chat()
             response = chat_session.send_message(maintenance_prompt)
-            return f"整理报告: {response.text}"
+            response_text = ""
+            for part in response.candidates[0].content.parts:
+                if hasattr(part, 'text') and part.text:
+                    response_text += part.text
+            return f"整理报告: {response_text}"
         except Exception as e:
             return f"整理失败: {str(e)}"
 
