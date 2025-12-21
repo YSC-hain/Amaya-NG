@@ -48,6 +48,7 @@ Vibe: 你通常会比较冷静, 说话简洁。就像一个话少但靠谱的多
 你没有数据库，你只有文件。你必须通过 `list_memories` 和 `read_memory` 来"回忆"更多的内容。
 - 记忆持久化: 重要的事(课表、DDL、长期目标)必须存入文件。
 - 自动归档: 哪怕我没让你记, 如果你觉得某句话很重要, 也要主动创建文件记录或加入对应的文件。
+- 例如, 你可以将我的喜好、习惯等数据记入`user_profile.md`, 将现在正在进行的长期计划记入`current_goals.md`.
 
 ### Tools
 1. Timer: 使用 `schedule_reminder` 设置提醒。注意单位换算。
@@ -76,7 +77,7 @@ Vibe: 你通常会比较冷静, 说话简洁。就像一个话少但靠谱的多
 ### Tips
 - 优先检查计时器: 设置新提醒前, 请查看“ACTIVE TIMERS”列表。若存在相似提醒, 请勿重复创建, 只需告知用户该提醒已设置。
 - 参考日常计划: 规划时请参照上下文中可见的`routine.md`内容.
-- 在每个任务完成后或规划完成后, 你都应该刷新 `pending_jobs.json`
+- 在每个任务完成后或规划完成后, 你都应该刷新 `pending_reminders.json` 以去除可能存在的重复提醒。
 - 你应该主动提醒用户睡觉、调整状态(包括但不限于喝水)等
 
 ### TONE GUIDELINES
@@ -159,10 +160,12 @@ Vibe: 你通常会比较冷静, 说话简洁。就像一个话少但靠谱的多
                 img = PIL.Image.open(io.BytesIO(image_bytes))
                 input_content = [full_input, img]
 
+            # print(input_content)
             response = chat_session.send_message(input_content)
+            # print(response.candidates[0].content)
             response_text = ""
             for part in response.candidates[0].content.parts:
-                if hasattr(part, 'text') and part.text:
+                if hasattr(part, 'text') and part.text and part.thought != True:
                     response_text += part.text
 
             # 更新短期记忆库
@@ -182,21 +185,17 @@ Vibe: 你通常会比较冷静, 说话简洁。就像一个话少但靠谱的多
         """
         try:
             print("Amaya 正在进行自主整理...")
-            pinned_context = get_pinned_content()
-            memeories_list = list_memories()
+            context = get_global_context_string()
             maintenance_prompt = f"""
 [System Maintenance Mode]
-Current Pinned Context:
-{pinned_context}
-
-Memories List:
-{memeories_list}
+Context:
+{context}
 
 Task:
 1. 如果有太多零散的日记, 请将它们按日期合并为一个类似 `journal_summary_2025_12.md` 的文件, 并归档旧文件。
 2. 如果有过期的任务, 请将其删除。
-3. 优化文件结构，使其更清晰。
-4. 注意不要在操作中删除有价值的信息。
+3. 注意不要在操作中删除有价值的信息。
+4. ["routine.json", "plan.md", "user_profile.md", "current_goals.md"] 是默认存在的文件, 你不应该归档它们, 但可以修改内容。
 
 只执行必要的操作。如果没有什么要改的，就回答"System clean."。
 """
@@ -205,8 +204,9 @@ Task:
             response = chat_session.send_message(maintenance_prompt)
             response_text = ""
             for part in response.candidates[0].content.parts:
-                if hasattr(part, 'text') and part.text:
+                if hasattr(part, 'text') and part.text and part.thought != True:
                     response_text += part.text
+
             return f"整理报告: {response_text}"
         except Exception as e:
             return f"整理失败: {str(e)}"
