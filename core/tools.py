@@ -1,5 +1,4 @@
 # core/tools.py
-from datetime import datetime
 import json
 import time
 from utils.storage import (
@@ -63,7 +62,7 @@ def pin_memory(filename: str, is_pinned: bool = True):
 
 SYS_EVENT_FILE = "data/sys_event_bus.jsonl" # 保持不变
 
-def schedule_reminder(delay_seconds: int, prompt: str):
+def schedule_reminder(delay_seconds: int, prompt: str):  # ToDo: 优化参数格式(例如加入字符串格式的时间)以便于LLM计算
     """
     设置一个reminder
 

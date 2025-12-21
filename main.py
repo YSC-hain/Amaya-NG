@@ -1,16 +1,17 @@
 # main.py
-import os
-import json
 import logging
 import time
+import datetime
+import asyncio
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, filters, CallbackQueryHandler
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 import config
 from core.agent import amaya
-from core.tools import SYS_EVENT_FILE
-from utils.storage import load_json, save_json, get_pending_reminders_summary
+from core.reminder_scheduler import ReminderScheduler
+from utils.storage import get_pending_reminders_summary
 
 
 # --- 设置日志 ---
@@ -140,129 +141,23 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # --- 定义整理任务 ---
-async def maintenance_job(context: ContextTypes.DEFAULT_TYPE):
+async def maintenance_job():
     """后台任务：触发 Amaya 自主整理"""
     if config.OWNER_ID:
-        # 通知用户开始整理（可选，也可以静默进行）
-        # await context.bot.send_message(chat_id=config.OWNER_ID, text="🌙 Amaya 正在整理记忆碎片...")
-
         # 调用大脑的整理功能
         report = await amaya.tidying_up()
-
-        # 整理完发个报告（或者存日志）
-        # await context.bot.send_message(chat_id=config.OWNER_ID, text=f"✨ 整理完成。\n{report}")
         logger.info(f"Maintenance Report: {report}")
 
 
 
-# --- 动态提醒与持久化逻辑 ---
-
-def update_pending_reminders(reminder_id, run_at, prompt, remove=False):
-    """维护 data/pending_reminders.json 文件，确保任务持久化"""
-    reminders = load_json("pending_reminders", default=[])
-    if remove:
-        reminders = [j for j in reminders if j.get("id") != reminder_id]
-    else:
-        reminders.append({"id": reminder_id, "run_at": run_at, "prompt": prompt})
-    save_json("pending_reminders", reminders)
-
-async def execute_reminder(context: ContextTypes.DEFAULT_TYPE):
-    """[回调] 当闹钟时间到时，此函数被触发"""
-    job = context.job
-    prompt = job.data
-    job_id = job.name
-
-    logger.info(f"触发提醒任务: {prompt}")
-
-    # 1. 构造系统指令，让 Amaya 组织语言
-    system_trigger = f"[SYSTEM_EVENT] 提醒时间已到。原定计划是：'{prompt}'。请根据此指令，并结合当前记忆，生成一条提醒信息。"
-    response = await amaya.chat(system_trigger)
-
-    # 2. 发送提醒
-    if config.OWNER_ID:
-        await context.bot.send_message(
-            chat_id=config.OWNER_ID,
-            text=response,
-            parse_mode='Markdown'
-        )
-
-    # 3. 【关键】从持久化文件中移除已完成的任务
-    update_pending_reminders(job_id, 0, "", remove=True)
-    logger.info(f"任务 {job_id} 已完成并从持久化记录中移除。")
-
-
-# 系统总线监听器 (这是负责从文件里拿任务的人)
-async def check_system_events(context: ContextTypes.DEFAULT_TYPE):
-    """[后台任务] 每5秒检查一次 sys_event_bus.jsonl，注册新任务"""
-    sys_bus_path = "data/sys_event_bus.jsonl"
-    if not os.path.exists(sys_bus_path):
-        return
-
-    try:
-        with open(sys_bus_path, 'r+', encoding='utf-8') as f:
-            lines = f.readlines()
-            if not lines:
-                return
-
-            # 清空文件，防止重复处理
-            f.seek(0)
-            f.truncate()
-
-        for line in lines:
-            if not line.strip(): continue
-            event = json.loads(line)
-
-            if event.get("type") == "reminder":
-                run_at = event["run_at"]
-                delay = run_at - time.time()
-                prompt = event["prompt"]
-                job_id = f"reminder_{int(run_at)}"  # ToDo: 优化ID的表示
-
-                if delay > 0:
-                    # 注册到内存 JobQueue
-                    context.job_queue.run_once(execute_reminder, delay, name=job_id, data=prompt)
-                    # 写入持久化文件
-                    update_pending_reminders(job_id, run_at, prompt)
-                    logger.info(f"已调度并持久化新任务: '{prompt}' ({int(delay)}s后)")
-            elif event.get("type") == "clear_reminder":
-                reminder_id = event["reminder_id"]
-                reminders = context.job_queue.get_jobs_by_name(reminder_id)
-                if reminders:
-                    reminders[0].schedule_removal()
-                update_pending_reminders(reminder_id, 0, "", remove=True)
-                logger.info(f"已清除提醒任务: {reminder_id}")
-    except Exception as e:
-        logger.error(f"处理系统事件总线失败: {e}")
-
-async def restore_reminders(context: ContextTypes.DEFAULT_TYPE):
-    """[启动任务] 程序启动时，恢复所有未完成的持久化reminder"""
-    reminders = load_json("pending_reminders", default=[])
-    now = time.time()
-    if not reminders:
-        logger.info("没有需要恢复的提醒。")
-        return
-
-    logger.info(f"正在恢复 {len(reminders)} 个未执行的提醒...")
-    for reminder in reminders:
-        delay = reminder.get('run_at', 0) - now
-        reminder_id = reminder.get('id')
-        prompt = reminder.get('prompt')
-
-        if not reminder_id: continue
-
-        if delay > 0:
-            context.job_queue.run_once(execute_reminder, delay, name=reminder_id, data=prompt)
-            logger.info(f"已恢复提醒: '{prompt}' ({int(delay)}s后)")
-        else:
-            # 对于已错过的任务，立即触发
-            context.job_queue.run_once(execute_reminder, 1, name=reminder_id, data=f"[延迟的提醒] {prompt}")
-            logger.warning(f"发现已错过的提醒，将立即补发: '{prompt}'")
-
-
 # --- 5. 主程序入口 ---
-if __name__ == '__main__':
+async def main():
     # 构建 App
     application = ApplicationBuilder().token(config.TOKEN).build()
+
+    # 初始化APScheduler
+    scheduler = AsyncIOScheduler()
+    reminder_scheduler = ReminderScheduler(scheduler, application.bot)
 
     # 注册命令 (Command Handlers)
     application.add_handler(CommandHandler('start', start))
@@ -277,14 +172,19 @@ if __name__ == '__main__':
     application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), chat_handler))
     application.add_handler(MessageHandler(filters.PHOTO, photo_handler))
 
-    # 注册后台定时任务 (JobQueue)
-    job_queue = application.job_queue
+    # 注册后台定时任务
     if config.OWNER_ID:
-        job_queue.run_once(restore_reminders, 1, name="restore_reminders_on_startup")  # 【关键】启动1秒后，执行一次恢复任务
+        # 恢复提醒
+        scheduler.add_job(reminder_scheduler.restore_reminders, 'date', run_date=datetime.datetime.fromtimestamp(time.time() + 1))
+        # 系统事件检查
+        scheduler.add_job(reminder_scheduler.check_system_events, 'interval', seconds=5, next_run_time=datetime.datetime.fromtimestamp(time.time() + 5))
+        # 维护任务
+        scheduler.add_job(maintenance_job, 'interval', hours=8, next_run_time=datetime.datetime.fromtimestamp(time.time() + 7200))
 
-        job_queue.run_repeating(check_system_events, interval=5, first=5, name="system_bus_check")
-        job_queue.run_repeating(maintenance_job, interval=28800, first=7200)
-
+    scheduler.start()
     logger.info("Agent 正在启动...")
     # 跑起来！
-    application.run_polling()
+    await asyncio.to_thread(application.run_polling)
+
+if __name__ == '__main__':
+    asyncio.run(main())

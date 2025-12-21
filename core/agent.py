@@ -1,14 +1,13 @@
 # core/agent.py
 import os
 import time
-import asyncio
 import PIL.Image
 import io
 from google import genai
 from google.genai import types
 from config import GEMINI_API_KEY
-from core.tools import tools_registry, list_memories
-from utils.storage import get_pinned_content, get_global_context_string
+from core.tools import tools_registry
+from utils.storage import get_global_context_string
 from datetime import datetime
 
 GEMINI_API_BASE = os.getenv("GEMINI_API_BASE")
@@ -101,7 +100,7 @@ Vibe: 你通常会比较冷静, 说话简洁。就像一个话少但靠谱的多
         return formatted_history
 
 
-    def _create_chat(self, use_smart_model=False, history=[]):
+    def _create_chat(self, use_smart_model=False, history=None):
         """根据任务难度选择模型"""
         model_name = self.smart_model if use_smart_model else self.fast_model
 
@@ -131,7 +130,7 @@ Vibe: 你通常会比较冷静, 说话简洁。就像一个话少但靠谱的多
         # 动态选择模型
         # 如果涉及规划、反思、大量文件操作，切换到 Smart 模型
         logic_keywords = ["规划", "计划", "安排", "整理", "复盘", "反思", "分析", "schedule", "plan"]
-        use_smart = (image_bytes != None) or any(k in user_text for k in logic_keywords)
+        use_smart = (image_bytes is not None) or any(k in user_text for k in logic_keywords)
 
         try:
             # 1. 获取上下文
@@ -166,7 +165,7 @@ Vibe: 你通常会比较冷静, 说话简洁。就像一个话少但靠谱的多
             # print(response.candidates[0].content)
             response_text = ""
             for part in response.candidates[0].content.parts:
-                if hasattr(part, 'text') and part.text and part.thought != True:
+                if hasattr(part, 'text') and part.text and part.thought is not True:
                     response_text += part.text
 
             # 更新短期记忆库
@@ -205,7 +204,7 @@ Task:
             response = chat_session.send_message(maintenance_prompt)
             response_text = ""
             for part in response.candidates[0].content.parts:
-                if hasattr(part, 'text') and part.text and part.thought != True:
+                if hasattr(part, 'text') and part.text and part.thought is not True:
                     response_text += part.text
 
             return f"整理报告: {response_text}"

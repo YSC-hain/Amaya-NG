@@ -63,8 +63,9 @@ def write_file_content(filename, content):
         with open(path, 'w', encoding='utf-8') as f:
             f.write(content)
         return True
-    except:
-        return False
+    except Exception as e:
+        print(f"向{filename}写入数据时遇到错误: f{e}")
+        return False  # ToDo: 记录错误
 
 def delete_file(filename):
     """删除记忆库中的文件"""
