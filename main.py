@@ -1,6 +1,5 @@
 # main.py
 import logging
-import time
 import datetime
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -151,36 +150,65 @@ async def maintenance_job():
 
 # --- 5. 主程序入口 ---
 if __name__ == '__main__':
-    # 构建 App
-    application = ApplicationBuilder().token(config.TOKEN).build()
-
-    # 初始化APScheduler
+    # 1. 初始化调度器 (但不立即启动)
     scheduler = AsyncIOScheduler()
-    reminder_scheduler = ReminderScheduler(scheduler, application.bot)
 
-    # 注册命令 (Command Handlers)
+    # 2. 定义启动钩子函数
+    async def on_startup(app):
+        """在 Bot 启动且事件循环就绪后执行"""
+        # 初始化自定义调度器逻辑
+        # 注意：这里我们传入 app.bot，确保调度器能发消息
+        reminder_scheduler = ReminderScheduler(scheduler, app.bot)
+
+        # 启动调度器 (此时 loop 已存在，不会报错)
+        scheduler.start()
+
+        if config.OWNER_ID:
+            # 添加任务
+            # 使用 datetime.datetime.now() 更符合直觉
+            now = datetime.datetime.now()
+
+            # 立即恢复提醒 (延迟1秒)
+            scheduler.add_job(
+                reminder_scheduler.restore_reminders,
+                'date',
+                run_date=now + datetime.timedelta(seconds=1)
+            )
+
+            # 系统事件检查 (每5秒)
+            scheduler.add_job(
+                reminder_scheduler.check_system_events,
+                'interval',
+                seconds=5
+            )
+
+            # 维护任务 (每8小时)
+            scheduler.add_job(
+                maintenance_job,
+                'interval',
+                hours=8
+            )
+
+        logger.info("[Init] 调度器已在 post_init 中成功启动")
+
+
+
+    # 3. 构建 App (注入 post_init)
+    application = (
+        ApplicationBuilder()
+        .token(config.TOKEN)
+        .post_init(on_startup) # <--- 关键修改：注册启动钩子
+        .build()
+    )
+
+    # 4. 注册 Handlers (保持不变)
     application.add_handler(CommandHandler('start', start))
     application.add_handler(CommandHandler('ping', ping))
     application.add_handler(CommandHandler('reminders', reminders))
-
-    # 注册回调查询处理器
     application.add_handler(CallbackQueryHandler(handle_callback))
-
-    # 注册消息处理器 (Message Handler) - 必须放在命令之后
-    # 过滤掉命令，只处理纯文本
     application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), chat_handler))
     application.add_handler(MessageHandler(filters.PHOTO, photo_handler))
 
-    # 注册后台定时任务
-    if config.OWNER_ID:
-        # 恢复提醒
-        scheduler.add_job(reminder_scheduler.restore_reminders, 'date', run_date=datetime.datetime.fromtimestamp(time.time() + 1))
-        # 系统事件检查
-        scheduler.add_job(reminder_scheduler.check_system_events, 'interval', seconds=5, next_run_time=datetime.datetime.fromtimestamp(time.time() + 5))
-        # 维护任务
-        scheduler.add_job(maintenance_job, 'interval', hours=8, next_run_time=datetime.datetime.fromtimestamp(time.time() + 7200))
-
-    scheduler.start()
     logger.info("Agent 正在启动...")
     # 跑起来！
     application.run_polling(stop_signals=None)
