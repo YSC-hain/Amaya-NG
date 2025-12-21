@@ -161,6 +161,6 @@ def get_global_context_string():
 
     # 4. 注入 Pending Reminders (这能有效防止重复设置提醒！)
     reminders_summary = get_pending_reminders_summary()
-    context_parts.append(f"\n=== ⏰ ACTIVE TIMERS (PENDING) ===\n{reminders_summary}")
+    context_parts.append(f"\n=== ACTIVE TIMERS (PENDING) ===\n{reminders_summary}")
 
     return "\n".join(context_parts)
