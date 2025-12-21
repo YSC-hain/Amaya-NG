@@ -2,7 +2,6 @@
 import logging
 import time
 import datetime
-import asyncio
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, filters, CallbackQueryHandler
@@ -151,7 +150,7 @@ async def maintenance_job():
 
 
 # --- 5. 主程序入口 ---
-async def main():
+if __name__ == '__main__':
     # 构建 App
     application = ApplicationBuilder().token(config.TOKEN).build()
 
@@ -184,7 +183,4 @@ async def main():
     scheduler.start()
     logger.info("Agent 正在启动...")
     # 跑起来！
-    await asyncio.to_thread(application.run_polling)
-
-if __name__ == '__main__':
-    asyncio.run(main())
+    application.run_polling(stop_signals=None)
