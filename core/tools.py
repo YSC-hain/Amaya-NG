@@ -36,7 +36,7 @@ def save_memory(filename: str, content: str):
     保存记忆。
     - 如果是记日记，可以叫 journal_2025.txt
     - 如果是任务，可以叫 current_tasks.md
-    - 你可以自主决定文件名和格式。
+    - 该函数不能用来修改reminder
     """
     if write_file_content(filename, content):
         return f"Saved to {filename}."
@@ -65,7 +65,7 @@ SYS_EVENT_FILE = "data/sys_event_bus.jsonl" # 保持不变
 
 def schedule_reminder(delay_seconds: int, prompt: str):
     """
-    设置一个定时提醒。
+    设置一个reminder
 
     Args:
         delay_seconds: 延迟多少秒
@@ -88,7 +88,7 @@ def schedule_reminder(delay_seconds: int, prompt: str):
 
 def clear_reminder(reminder_id: str):
     """
-    清除某个定时提醒
+    清除某个reminder
 
     Args:
         reminder_id: 具体的id, 例如"reminder_1766242804"

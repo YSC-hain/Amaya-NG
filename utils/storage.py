@@ -12,7 +12,7 @@ os.makedirs(DATA_DIR, exist_ok=True)
 # 集中管理所有数据文件路径
 FILES = {
     "meta": os.path.join("data", "meta.json"),
-    "pending_jobs": os.path.join("data", "pending_jobs.json"),
+    "pending_reminders": os.path.join("data", "pending_reminders.json"),
     "sys_bus": os.path.join("data", "sys_event_bus.jsonl")
 }
 
@@ -104,18 +104,18 @@ def get_pinned_content():
 # 定义哪些文件是 Amaya "睁眼" 就应该看见的 (即使没有被 Pin)
 DEFAULT_VISIBLE_FILES = ["routine.json", "plan.md", "user_profile.md", "current_goals.md"]
 
-def get_pending_jobs_summary():
+def get_pending_reminders_summary():
     """将挂起的闹钟任务转换为较为可读的摘要"""
-    jobs = load_json("pending_jobs", default=[])
-    if not jobs:
+    reminders = load_json("pending_reminders", default=[])
+    if not reminders:
         return "无挂起的提醒任务。"
 
     summary = ['以下是提醒任务列表']
     now = time.time()
-    for job in jobs:
-        id = job.get('id', '')
-        run_at = job.get('run_at', 0)
-        prompt = job.get('prompt', '未知任务')
+    for reminder in reminders:
+        id = reminder.get('id', '')
+        run_at = reminder.get('run_at', 0)
+        prompt = reminder.get('prompt', '未知任务')
 
         # 计算剩余时间
         diff = int(run_at - now)
@@ -136,7 +136,7 @@ def get_global_context_string():
     包括：
     1. Pinned Files (用户手动置顶)
     2. Default Files (系统默认可见，如 routine.md)
-    3. Pending Jobs (当前的闹钟列表)
+    3. Pending Reminders (当前的提醒列表)
     4. etc
     """
     context_parts = []
@@ -159,8 +159,8 @@ def get_global_context_string():
                 # 加上文件名作为标题，方便 AI 区分
                 context_parts.append(f"\n--- FILE: {fname} ---\n{content}")
 
-    # 4. 注入 Pending Jobs (这能有效防止重复设置提醒！)
-    jobs_summary = get_pending_jobs_summary()
-    context_parts.append(f"\n=== ⏰ ACTIVE TIMERS (PENDING) ===\n{jobs_summary}")
+    # 4. 注入 Pending Reminders (这能有效防止重复设置提醒！)
+    reminders_summary = get_pending_reminders_summary()
+    context_parts.append(f"\n=== ⏰ ACTIVE TIMERS (PENDING) ===\n{reminders_summary}")
 
     return "\n".join(context_parts)

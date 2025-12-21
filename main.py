@@ -10,7 +10,7 @@ from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, Messa
 import config
 from core.agent import amaya
 from core.tools import SYS_EVENT_FILE
-from utils.storage import load_json, save_json, get_pending_jobs_summary
+from utils.storage import load_json, save_json, get_pending_reminders_summary
 
 
 # --- 设置日志 ---
@@ -58,7 +58,7 @@ async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def reminders(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """查看挂起的提醒任务"""
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
-    summary = get_pending_jobs_summary()
+    summary = get_pending_reminders_summary()
     keyboard = [
         [InlineKeyboardButton("刷新", callback_data='refresh_reminders')],
         [InlineKeyboardButton("关闭", callback_data='close_reminders')]
@@ -72,7 +72,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
 
     if query.data == 'refresh_reminders':
-        summary = get_pending_jobs_summary()
+        summary = get_pending_reminders_summary()
         keyboard = [
             [InlineKeyboardButton("刷新", callback_data='refresh_reminders')],
             [InlineKeyboardButton("关闭", callback_data='close_reminders')]
@@ -157,14 +157,14 @@ async def maintenance_job(context: ContextTypes.DEFAULT_TYPE):
 
 # --- 动态提醒与持久化逻辑 ---
 
-def update_pending_jobs(job_id, run_at, prompt, remove=False):
-    """维护 data/pending_jobs.json 文件，确保任务持久化"""
-    jobs = load_json("pending_jobs", default=[])
+def update_pending_reminders(reminder_id, run_at, prompt, remove=False):
+    """维护 data/pending_reminders.json 文件，确保任务持久化"""
+    reminders = load_json("pending_reminders", default=[])
     if remove:
-        jobs = [j for j in jobs if j.get("id") != job_id]
+        reminders = [j for j in reminders if j.get("id") != reminder_id]
     else:
-        jobs.append({"id": job_id, "run_at": run_at, "prompt": prompt})
-    save_json("pending_jobs", jobs)
+        reminders.append({"id": reminder_id, "run_at": run_at, "prompt": prompt})
+    save_json("pending_reminders", reminders)
 
 async def execute_reminder(context: ContextTypes.DEFAULT_TYPE):
     """[回调] 当闹钟时间到时，此函数被触发"""
@@ -187,7 +187,7 @@ async def execute_reminder(context: ContextTypes.DEFAULT_TYPE):
         )
 
     # 3. 【关键】从持久化文件中移除已完成的任务
-    update_pending_jobs(job_id, 0, "", remove=True)
+    update_pending_reminders(job_id, 0, "", remove=True)
     logger.info(f"任务 {job_id} 已完成并从持久化记录中移除。")
 
 
@@ -216,47 +216,47 @@ async def check_system_events(context: ContextTypes.DEFAULT_TYPE):
                 run_at = event["run_at"]
                 delay = run_at - time.time()
                 prompt = event["prompt"]
-                job_id = f"reminder_{int(run_at)}"
+                job_id = f"reminder_{int(run_at)}"  # ToDo: 优化ID的表示
 
                 if delay > 0:
                     # 注册到内存 JobQueue
                     context.job_queue.run_once(execute_reminder, delay, name=job_id, data=prompt)
                     # 写入持久化文件
-                    update_pending_jobs(job_id, run_at, prompt)
+                    update_pending_reminders(job_id, run_at, prompt)
                     logger.info(f"已调度并持久化新任务: '{prompt}' ({int(delay)}s后)")
             elif event.get("type") == "clear_reminder":
                 reminder_id = event["reminder_id"]
-                jobs = context.job_queue.get_jobs_by_name(reminder_id)
-                if jobs:
-                    jobs[0].schedule_removal()
-                update_pending_jobs(reminder_id, 0, "", remove=True)
+                reminders = context.job_queue.get_jobs_by_name(reminder_id)
+                if reminders:
+                    reminders[0].schedule_removal()
+                update_pending_reminders(reminder_id, 0, "", remove=True)
                 logger.info(f"已清除提醒任务: {reminder_id}")
     except Exception as e:
         logger.error(f"处理系统事件总线失败: {e}")
 
-async def restore_jobs(context: ContextTypes.DEFAULT_TYPE):
-    """[启动任务] 程序启动时，恢复所有未完成的持久化任务"""
-    jobs = load_json("pending_jobs", default=[])
+async def restore_reminders(context: ContextTypes.DEFAULT_TYPE):
+    """[启动任务] 程序启动时，恢复所有未完成的持久化reminder"""
+    reminders = load_json("pending_reminders", default=[])
     now = time.time()
-    if not jobs:
-        logger.info("没有需要恢复的任务。")
+    if not reminders:
+        logger.info("没有需要恢复的提醒。")
         return
 
-    logger.info(f"正在恢复 {len(jobs)} 个未完成的任务...")
-    for job in jobs:
-        delay = job.get('run_at', 0) - now
-        job_id = job.get('id')
-        prompt = job.get('prompt')
+    logger.info(f"正在恢复 {len(reminders)} 个未执行的提醒...")
+    for reminder in reminders:
+        delay = reminder.get('run_at', 0) - now
+        reminder_id = reminder.get('id')
+        prompt = reminder.get('prompt')
 
-        if not job_id: continue
+        if not reminder_id: continue
 
         if delay > 0:
-            context.job_queue.run_once(execute_reminder, delay, name=job_id, data=prompt)
-            logger.info(f"已恢复任务: '{prompt}' ({int(delay)}s后)")
+            context.job_queue.run_once(execute_reminder, delay, name=reminder_id, data=prompt)
+            logger.info(f"已恢复提醒: '{prompt}' ({int(delay)}s后)")
         else:
             # 对于已错过的任务，立即触发
-            context.job_queue.run_once(execute_reminder, 1, name=job_id, data=f"[延迟的提醒] {prompt}")
-            logger.warning(f"发现已错过的任务，将立即补发: '{prompt}'")
+            context.job_queue.run_once(execute_reminder, 1, name=reminder_id, data=f"[延迟的提醒] {prompt}")
+            logger.warning(f"发现已错过的提醒，将立即补发: '{prompt}'")
 
 
 # --- 5. 主程序入口 ---
@@ -280,7 +280,7 @@ if __name__ == '__main__':
     # 注册后台定时任务 (JobQueue)
     job_queue = application.job_queue
     if config.OWNER_ID:
-        job_queue.run_once(restore_jobs, 1, name="restore_jobs_on_startup")  # 【关键】启动1秒后，执行一次恢复任务
+        job_queue.run_once(restore_reminders, 1, name="restore_reminders_on_startup")  # 【关键】启动1秒后，执行一次恢复任务
 
         job_queue.run_repeating(check_system_events, interval=5, first=5, name="system_bus_check")
         job_queue.run_repeating(maintenance_job, interval=28800, first=7200)
