@@ -24,11 +24,21 @@ logging.getLogger("telegram.ext._application").setLevel(logging.WARNING)
 
 logger = logging.getLogger("Amaya")
 
+# --- 权限控制 ---
+def _is_authorized(chat_id: int) -> bool:
+    if not config.OWNER_ID:
+        logger.error("OWNER_ID 未配置，拒绝所有请求。")
+        return False
+    return str(chat_id) == str(config.OWNER_ID)
+
 # --- Handlers ---
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     chat_id = update.effective_chat.id
+    if not _is_authorized(chat_id):
+        await update.message.reply_text("未授权。仅限 OWNER 使用。")
+        return
     logger.info(f"User {user.first_name} started the bot. Chat ID: {chat_id}")
     await update.message.reply_text(
         f"你好，{user.first_name}。\n我是 Amaya 原型机。\nID: `{chat_id}`",
@@ -36,10 +46,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_authorized(update.effective_chat.id):
+        await update.message.reply_text("未授权。仅限 OWNER 使用。")
+        return
     await update.message.reply_text("Pong! 系统在线。")
 
 async def reminders(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """查看挂起的提醒任务"""
+    if not _is_authorized(update.effective_chat.id):
+        await update.message.reply_text("未授权。仅限 OWNER 使用。")
+        return
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
     summary = get_pending_reminders_summary() # 确保 utils/storage.py 里有这个函数
     keyboard = [
@@ -51,6 +67,9 @@ async def reminders(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    if not _is_authorized(query.from_user.id):
+        await query.edit_message_text("未授权。")
+        return
     if query.data == 'refresh_reminders':
         summary = get_pending_reminders_summary()
         keyboard = [
@@ -69,8 +88,8 @@ async def chat_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text
     chat_id = update.effective_chat.id
 
-    if config.OWNER_ID and str(chat_id) != config.OWNER_ID:
-        await update.message.reply_text("未授权。")
+    if not _is_authorized(chat_id):
+        await update.message.reply_text("未授权。仅限 OWNER 使用。")
         return
 
     await context.bot.send_chat_action(chat_id=chat_id, action="typing")
@@ -89,6 +108,9 @@ async def chat_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.error(f"消息发送彻底失败: {send_err}")
 
 async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_authorized(update.effective_chat.id):
+        await update.message.reply_text("未授权。仅限 OWNER 使用。")
+        return
     try:
         photo = update.message.photo[-1]
         file = await context.bot.get_file(photo.file_id)

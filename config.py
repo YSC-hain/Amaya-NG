@@ -21,7 +21,7 @@ if not GEMINI_API_KEY:
     raise ValueError("错误：未找到 GEMINI_API_KEY！")
 
 if not OWNER_ID:
-    logger.warning("未配置 OWNER_ID，部分功能（定时任务、自动整理）将不可用")
+    raise ValueError("错误：未配置 OWNER_ID。当前版本仅支持单一授权用户，请在 .env 中设置 OWNER_ID。")
 
 
 # --- 调度配置 ---
