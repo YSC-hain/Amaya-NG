@@ -18,8 +18,8 @@ class ReminderScheduler:
     def __init__(self, scheduler: AsyncIOScheduler, bot):
         self.scheduler = scheduler
         self.bot = bot
-        # 强制指定时区，防止 APScheduler 使用 UTC 导致提醒时间偏差
-        self.timezone = pytz.timezone('Asia/Shanghai')
+        # 使用配置中的时区
+        self.timezone = pytz.timezone(config.TIMEZONE)
 
     async def restore_reminders(self):
         """启动时恢复未完成的提醒"""

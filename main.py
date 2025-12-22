@@ -131,7 +131,7 @@ if __name__ == '__main__':
 
         # 启动调度器
         scheduler.start()
-        logger.info("✅ 调度器已启动")
+        logger.info("[Init] 调度器已启动")
 
         if config.OWNER_ID:
             now = datetime.datetime.now()
@@ -139,21 +139,32 @@ if __name__ == '__main__':
             # 立即恢复任务
             scheduler.add_job(reminder_scheduler.restore_reminders, 'date', run_date=now + datetime.timedelta(seconds=1))
 
-            # 监听系统总线 (每5秒)
-            scheduler.add_job(reminder_scheduler.check_system_events, 'interval', seconds=5)
+            # 监听系统总线
+            scheduler.add_job(reminder_scheduler.check_system_events, 'interval', seconds=config.EVENT_BUS_CHECK_INTERVAL)
 
-            # 每日整理 (每8小时)
-            scheduler.add_job(maintenance_job, 'interval', hours=8)
+            # 定期整理
+            scheduler.add_job(maintenance_job, 'interval', hours=config.MAINTENANCE_INTERVAL_HOURS)
 
-    # 3. 构建 App
+    # 3. 关闭钩子
+    async def on_shutdown(app):
+        logger.info("正在关闭 Amaya...")
+        # 保存 Amaya 状态（短期记忆等）
+        amaya.shutdown()
+        # 关闭调度器
+        if scheduler.running:
+            scheduler.shutdown(wait=False)
+        logger.info("Amaya 已安全关闭")
+
+    # 4. 构建 App
     application = (
         ApplicationBuilder()
         .token(config.TOKEN)
         .post_init(on_startup)
+        .post_shutdown(on_shutdown)
         .build()
     )
 
-    # 4. 注册 Handlers
+    # 5. 注册 Handlers
     application.add_handler(CommandHandler('start', start))
     application.add_handler(CommandHandler('ping', ping))
     application.add_handler(CommandHandler('reminders', reminders))

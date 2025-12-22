@@ -2,10 +2,23 @@
 import json
 import os
 import logging
+import threading
 from datetime import datetime
 import time
+from typing import Any, Optional, List
 
 logger = logging.getLogger("Amaya.Storage")
+
+# 全局文件锁，防止并发读写
+_file_locks: dict[str, threading.Lock] = {}
+_locks_lock = threading.Lock()  # 保护 _file_locks 的锁
+
+def _get_file_lock(path: str) -> threading.Lock:
+    """获取指定文件的锁"""
+    with _locks_lock:
+        if path not in _file_locks:
+            _file_locks[path] = threading.Lock()
+        return _file_locks[path]
 
 # 定义记忆库的物理路径
 DATA_DIR = "data/memory_bank"
@@ -16,48 +29,78 @@ os.makedirs(DATA_DIR, exist_ok=True)
 FILES = {
     "meta": os.path.join("data", "meta.json"),
     "pending_reminders": os.path.join("data", "pending_reminders.json"),
-    "sys_bus": os.path.join("data", "sys_event_bus.jsonl")
+    "sys_bus": os.path.join("data", "sys_event_bus.jsonl"),
+    "short_term_memory": os.path.join("data", "short_term_memory.json")
 }
 
 # --- 通用文件读写 ---
-def load_json(file_key, default=None):
-    """读取指定的 JSON 文件"""
+def load_json(file_key: str, default: Optional[Any] = None) -> Any:
+    """读取指定的 JSON 文件（线程安全）"""
     path = FILES.get(file_key)
     if not path or not os.path.exists(path):
         return default if default is not None else []
-    try:
-        with open(path, 'r', encoding='utf-8') as f:
-            return json.load(f)
-    except json.JSONDecodeError as e:
-        logger.error(f"JSON 解析失败 {path}: {e}")
-        return default if default is not None else []
-    except IOError as e:
-        logger.warning(f"读取文件失败 {path}: {e}")
-        return default if default is not None else []
 
-def save_json(file_key, data):
-    """保存数据到指定的 JSON 文件"""
+    lock = _get_file_lock(path)
+    with lock:
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except json.JSONDecodeError as e:
+            logger.error(f"JSON 解析失败 {path}: {e}")
+            return default if default is not None else []
+        except IOError as e:
+            logger.warning(f"读取文件失败 {path}: {e}")
+            return default if default is not None else []
+
+def save_json(file_key: str, data: Any) -> bool:
+    """保存数据到指定的 JSON 文件（原子性写入，线程安全）"""
     path = FILES.get(file_key)
     if not path:
         logger.error(f"未知的 file_key: {file_key}")
         return False
-    try:
-        with open(path, 'w', encoding='utf-8') as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        return True
-    except IOError as e:
-        logger.error(f"保存 {path} 失败: {e}")
-        return False
-    except TypeError as e:
-        logger.error(f"JSON 序列化失败 {path}: {e}")
-        return False
+
+    lock = _get_file_lock(path)
+    temp_path = path + ".tmp"
+
+    with lock:
+        try:
+            with open(temp_path, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+
+            # 原子性替换（Windows 需要先删除目标文件）
+            if os.path.exists(path):
+                os.replace(temp_path, path)
+            else:
+                os.rename(temp_path, path)
+            return True
+        except IOError as e:
+            logger.error(f"保存 {path} 失败: {e}")
+            # 清理临时文件
+            if os.path.exists(temp_path):
+                try:
+                    os.remove(temp_path)
+                except OSError:
+                    pass
+            return False
+        except TypeError as e:
+            logger.error(f"JSON 序列化失败 {path}: {e}")
+            if os.path.exists(temp_path):
+                try:
+                    os.remove(temp_path)
+                except OSError:
+                    pass
+            return False
 
 # --- Amaya 记忆文件系统 API ---
-def list_files_in_memory():
+def list_files_in_memory() -> List[str]:
     """列出所有记忆文件"""
-    return [f for f in os.listdir(DATA_DIR) if not f.startswith('.')]
+    try:
+        return [f for f in os.listdir(DATA_DIR) if not f.startswith('.')]
+    except OSError as e:
+        logger.error(f"列出记忆文件失败: {e}")
+        return []
 
-def read_file_content(filename):
+def read_file_content(filename: str) -> Optional[str]:
     """读取记忆库中的文件内容"""
     path = os.path.join(DATA_DIR, os.path.basename(filename)) # 安全处理
     if not os.path.exists(path):
@@ -65,10 +108,14 @@ def read_file_content(filename):
     try:
         with open(path, 'r', encoding='utf-8') as f:
             return f.read()
+    except IOError as e:
+        logger.error(f"读取文件 {filename} 失败: {e}")
+        return None
     except Exception as e:
-        return f"Error reading file: {str(e)}"
+        logger.exception(f"读取文件 {filename} 异常: {e}")
+        return None
 
-def write_file_content(filename, content):
+def write_file_content(filename: str, content: str) -> bool:
     """写入/覆盖记忆库中的文件内容"""
     path = os.path.join(DATA_DIR, os.path.basename(filename))
     try:

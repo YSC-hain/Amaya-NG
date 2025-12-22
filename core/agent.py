@@ -5,46 +5,76 @@ import PIL.Image
 import io
 from google import genai
 from google.genai import types
-from config import GEMINI_API_KEY, GEMINI_API_BASE, CHAT_SYSTEM_PROMPT
+import config
 from core.tools import tools_registry
-from utils.storage import get_global_context_string
+from utils.storage import get_global_context_string, load_json, save_json
 from datetime import datetime
 
 logger = logging.getLogger("Amaya.Agent")
-
 
 
 class AmayaBrain:
     def __init__(self):
         # 1. 配置 HTTP 选项 (代理)
         http_options = None
-        if GEMINI_API_BASE:
+        if config.GEMINI_API_BASE:
             http_options = types.HttpOptions(
-                base_url=GEMINI_API_BASE,
+                base_url=config.GEMINI_API_BASE,
                 api_version="v1beta"
             )
 
         # 2. 初始化客户端
         self.client = genai.Client(
-            api_key=GEMINI_API_KEY,
+            api_key=config.GEMINI_API_KEY,
             http_options=http_options
         )
 
-        self.smart_model = "gemini-3-pro-preview"  # ToDo
-        self.fast_model = "gemini-3-flash-preview"
+        self.smart_model = config.SMART_MODEL
+        self.fast_model = config.FAST_MODEL
 
-        # 2. 短期记忆缓存 (内存存储)
+        # 3. 短期记忆缓存
         # 结构: [{"role": "user/model", "text": "...", "timestamp": 123456789}]
-        self.short_term_memory = []
-
+        self.short_term_memory = self._load_short_term_memory()
 
         # 核心人设
-        self.system_instruction = CHAT_SYSTEM_PROMPT
+        self.system_instruction = config.CHAT_SYSTEM_PROMPT
+
+    def _load_short_term_memory(self) -> list:
+        """从持久化存储加载短期记忆"""
+        try:
+            memory = load_json("short_term_memory", default=[])
+            if not isinstance(memory, list):
+                logger.warning("短期记忆格式异常，已重置")
+                return []
+            # 过滤掉过期的记忆
+            cutoff = time.time() - config.SHORT_TERM_MEMORY_TTL
+            valid_memory = [m for m in memory if m.get("timestamp", 0) > cutoff]
+            logger.info(f"已加载 {len(valid_memory)} 条短期记忆")
+            return valid_memory
+        except Exception as e:
+            logger.error(f"加载短期记忆失败: {e}")
+            return []
+
+    def _save_short_term_memory(self):
+        """持久化保存短期记忆"""
+        try:
+            if save_json("short_term_memory", self.short_term_memory):
+                logger.debug(f"已保存 {len(self.short_term_memory)} 条短期记忆")
+            else:
+                logger.warning("短期记忆保存失败")
+        except Exception as e:
+            logger.error(f"保存短期记忆异常: {e}")
+
+    def shutdown(self):
+        """优雅关闭，保存状态"""
+        logger.info("正在保存 Amaya 状态...")
+        self._save_short_term_memory()
+        logger.info("Amaya 状态已保存")
 
     def _get_cleaned_history(self):
-        """剔除超过 1 小时的历史记录"""
-        one_hour_ago = time.time() - 3600
-        self.short_term_memory = [m for m in self.short_term_memory if m["timestamp"] > one_hour_ago]
+        """剔除过期的历史记录"""
+        cutoff = time.time() - config.SHORT_TERM_MEMORY_TTL
+        self.short_term_memory = [m for m in self.short_term_memory if m.get("timestamp", 0) > cutoff]
 
         # 转换为 Gemini 接受的 history 格式 (不带时间戳)
         formatted_history = []
@@ -122,8 +152,12 @@ class AmayaBrain:
                     response_text += part.text
 
             # 更新短期记忆库
-            self.short_term_memory.append({"role": "user", "text": user_text, "timestamp": time.time()})
-            self.short_term_memory.append({"role": "model", "text": response_text, "timestamp": time.time()})
+            current_time = time.time()
+            self.short_term_memory.append({"role": "user", "text": user_text, "timestamp": current_time})
+            self.short_term_memory.append({"role": "model", "text": response_text, "timestamp": current_time})
+
+            # 异步保存短期记忆（非阻塞）
+            self._save_short_term_memory()
 
             return response_text
         except genai.errors.APIError as e:

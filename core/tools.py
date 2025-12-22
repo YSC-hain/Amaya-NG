@@ -1,6 +1,8 @@
 # core/tools.py
 import json
 import time
+import logging
+from typing import List
 from utils.storage import (
     list_files_in_memory,
     read_file_content,
@@ -9,10 +11,12 @@ from utils.storage import (
     toggle_pin_status
 )
 
+logger = logging.getLogger("Amaya.Tools")
+
 
 # --- 1. 感知类工具 ---
 
-def list_memories():
+def list_memories() -> str:
     """
     查看记忆库里有哪些文件
     """
@@ -21,7 +25,7 @@ def list_memories():
 
 # --- 2. 操作类工具 ---
 
-def read_memory(filename: str):
+def read_memory(filename: str) -> str:
     """
     读取某个文件的详细内容
     """
@@ -30,7 +34,7 @@ def read_memory(filename: str):
         return "File not found."
     return content
 
-def save_memory(filename: str, content: str):
+def save_memory(filename: str, content: str) -> str:
     """
     保存记忆。
     - 如果是记日记，可以叫 journal_2025.txt
@@ -41,7 +45,7 @@ def save_memory(filename: str, content: str):
         return f"Saved to {filename}."
     return "Save failed."
 
-def archive_memory(filename: str):
+def archive_memory(filename: str) -> str:
     """
     删除或归档不再需要的文件
     """
@@ -49,7 +53,7 @@ def archive_memory(filename: str):
         return f"Deleted {filename}."
     return "Delete failed."
 
-def pin_memory(filename: str, is_pinned: bool = True):
+def pin_memory(filename: str, is_pinned: bool = True) -> str:
     """
     将文件标记为'置顶记忆'或是取消标记
     被 Pin 的文件内容会在每次对话时自动出现在你的脑海里。
@@ -60,9 +64,9 @@ def pin_memory(filename: str, is_pinned: bool = True):
     return f"File {filename} is now {action}."
 
 
-SYS_EVENT_FILE = "data/sys_event_bus.jsonl" # 保持不变
+SYS_EVENT_FILE = "data/sys_event_bus.jsonl"  # 保持不变
 
-def schedule_reminder(delay_seconds: int, prompt: str):  # ToDo: 优化参数格式(例如加入字符串格式的时间)以便于LLM计算
+def schedule_reminder(delay_seconds: int, prompt: str) -> str:  # ToDo: 优化参数格式(例如加入字符串格式的时间)以便于LLM计算
     """
     设置一个reminder
 
@@ -73,19 +77,21 @@ def schedule_reminder(delay_seconds: int, prompt: str):  # ToDo: 优化参数格
     event = {
         "type": "reminder",
         "created_at": time.time(),
-        "run_at": time.time() + delay_seconds, # 【关键】存入绝对时间戳
+        "run_at": time.time() + delay_seconds,
         "prompt": prompt
     }
 
     try:
         with open(SYS_EVENT_FILE, 'a', encoding='utf-8') as f:
             f.write(json.dumps(event, ensure_ascii=False) + "\n")
+        logger.debug(f"已创建提醒: {delay_seconds}秒后 - {prompt}")
         return f"指令已下达：{delay_seconds}秒后执行 '{prompt}'。"
-    except Exception as e:
+    except IOError as e:
+        logger.error(f"写入事件总线失败: {e}")
         return f"设置失败: {str(e)}"
 
 
-def clear_reminder(reminder_id: str):
+def clear_reminder(reminder_id: str) -> str:
     """
     清除某个reminder
 
@@ -100,13 +106,15 @@ def clear_reminder(reminder_id: str):
     try:
         with open(SYS_EVENT_FILE, 'a', encoding='utf-8') as f:
             f.write(json.dumps(event, ensure_ascii=False) + "\n")
+        logger.debug(f"已请求清除提醒: {reminder_id}")
         return f"指令已下达：清除定时提醒, ID: {reminder_id}"
-    except Exception as e:
+    except IOError as e:
+        logger.error(f"写入事件总线失败: {e}")
         return f"设置失败: {str(e)}"
 
 
 # 注册所有工具
-tools_registry = [
+tools_registry: List = [
     list_memories,
     read_memory,
     save_memory,

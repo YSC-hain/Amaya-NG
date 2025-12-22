@@ -24,6 +24,17 @@ if not OWNER_ID:
     logger.warning("未配置 OWNER_ID，部分功能（定时任务、自动整理）将不可用")
 
 
+# --- 调度配置 ---
+EVENT_BUS_CHECK_INTERVAL = 5  # 事件总线检查间隔（秒）
+MAINTENANCE_INTERVAL_HOURS = 8  # 自动整理间隔（小时）
+SHORT_TERM_MEMORY_TTL = 10800  # 短期记忆过期时间（秒）
+TIMEZONE = "Asia/Shanghai"  # 时区
+
+# --- 模型配置 ---
+SMART_MODEL = "gemini-3-pro-preview"
+FAST_MODEL = "gemini-3-flash-preview"
+
+
 CHAT_SYSTEM_PROMPT = """
 ### Identity & Core
 Name: Amaya
