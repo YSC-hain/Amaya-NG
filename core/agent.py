@@ -109,11 +109,11 @@ class AmayaBrain:
         return f"Current Time: {now.strftime('%Y-%m-%d %A %H:%M')}"
 
 
-    async def chat(self, user_text: str, image_bytes: bytes = b'') -> str:
+    async def chat(self, user_text: str, image_bytes: bytes = b'', audio_bytes: bytes = b'', audio_mime: str = "audio/ogg") -> str:
         # 动态选择模型
         # 如果涉及规划、反思、大量文件操作，切换到 Smart 模型
         logic_keywords = ["规划", "计划", "安排", "整理", "复盘", "反思", "分析", "schedule", "plan"]
-        use_smart = (image_bytes is not None) or any(k in user_text for k in logic_keywords)
+        use_smart = (image_bytes or audio_bytes) or any(k in user_text for k in logic_keywords)
 
         try:
             # 1. 获取上下文
@@ -137,11 +137,13 @@ class AmayaBrain:
 """
 
             # 如果有图片，将其加入内容列表
-            input_content = full_input
+            input_content = [full_input]
             if image_bytes:
                 # 使用 PIL 处理字节流
                 img = PIL.Image.open(io.BytesIO(image_bytes))
-                input_content = [full_input, img]
+                input_content.append(img)
+            if audio_bytes:
+                input_content.append(types.Blob(data=audio_bytes, mime_type=audio_mime or "audio/ogg"))
 
             # print(input_content)
             response = chat_session.send_message(input_content)
