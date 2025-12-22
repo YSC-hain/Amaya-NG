@@ -137,17 +137,17 @@ class AmayaBrain:
 """
 
             # 构造 Content 对象，支持多模态输入
-            parts = [types.Part.from_text(text=full_input)]
+            parts = [full_input]  # 文本可以直接作为字符串
             if image_bytes:
                 # 使用 PIL 处理字节流
                 img = PIL.Image.open(io.BytesIO(image_bytes))
-                parts.append(types.Part.from_bytes(data=image_bytes, mime_type=image_bytes and f"image/{img.format.lower()}" or "image/png"))
+                parts.append(img)  # PIL.Image 可以直接传入
             if audio_bytes:
                 parts.append(types.Part.from_bytes(data=audio_bytes, mime_type=audio_mime or "audio/ogg"))
 
-            # 使用 Content 包装多个 parts
-            user_content = types.Content(role="user", parts=parts)
-            response = chat_session.send_message(user_content)
+            # 直接传递 parts 列表（单个元素时传元素本身）
+            message_input = parts[0] if len(parts) == 1 else parts
+            response = chat_session.send_message(message_input)
             # print(response.candidates[0].content)
             response_text = ""
             for part in response.candidates[0].content.parts:
