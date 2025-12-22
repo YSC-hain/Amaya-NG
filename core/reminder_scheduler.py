@@ -8,12 +8,16 @@ import secrets
 import pytz
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.date import DateTrigger
+from typing import TYPE_CHECKING
 
 from core.agent import amaya
 from utils.storage import load_json, save_json
 import config
 
-logger = logging.getLogger("Amaya")
+if TYPE_CHECKING:
+    from adapters.base import MessageSender
+
+logger = logging.getLogger("Amaya.Scheduler")
 
 
 def _build_reminder_id(run_at: float) -> str:
@@ -23,9 +27,9 @@ def _build_reminder_id(run_at: float) -> str:
     return f"r{ts_part}{rand_part}"
 
 class ReminderScheduler:
-    def __init__(self, scheduler: AsyncIOScheduler, bot):
+    def __init__(self, scheduler: AsyncIOScheduler, sender: "MessageSender"):
         self.scheduler = scheduler
-        self.bot = bot
+        self.sender = sender
         # 使用配置中的时区
         self.timezone = pytz.timezone(config.TIMEZONE)
 
@@ -171,17 +175,8 @@ class ReminderScheduler:
         system_trigger = f"[SYSTEM_EVENT] 提醒时间已到。原定计划是：'{prompt}'。请根据此指令，并结合当前记忆，生成一条提醒信息。"
         response = await amaya.chat(system_trigger)
 
-        # 发送消息
-        if config.OWNER_ID:
-            try:
-                await self.bot.send_message(
-                    chat_id=config.OWNER_ID,
-                    text=response,
-                    parse_mode='Markdown'
-                )
-            except Exception as e:
-                logger.warning(f"Markdown 发送失败，回退纯文本: {e}")
-                await self.bot.send_message(chat_id=config.OWNER_ID, text=response)
+        # 通过抽象接口发送消息
+        await self.sender.send_text(response)
 
         self.update_pending_reminders(job_id, 0, "", remove=True)
         logger.info(f"任务 {job_id} 已完成并从持久化记录中移除。")

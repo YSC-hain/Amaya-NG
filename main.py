@@ -1,20 +1,22 @@
 # main.py
+"""
+Amaya 主程序入口 —— 负责初始化调度器和启动适配器。
+调度器是平台无关的核心组件，适配器可替换。
+"""
 import logging
 import datetime
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, filters, CallbackQueryHandler
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 import config
 from core.agent import amaya
 from core.reminder_scheduler import ReminderScheduler
-from utils.storage import get_pending_reminders_summary
+from adapters.telegram_bot import build_application, register_handlers, TelegramSender
 
 # --- 设置日志 ---
 logging.basicConfig(
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    level=logging.INFO
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
 )
 
 logging.getLogger("apscheduler").setLevel(logging.WARNING)
@@ -24,175 +26,67 @@ logging.getLogger("telegram.ext._application").setLevel(logging.WARNING)
 
 logger = logging.getLogger("Amaya")
 
-# --- 权限控制 ---
-def _is_authorized(chat_id: int) -> bool:
-    if not config.OWNER_ID:
-        logger.error("OWNER_ID 未配置，拒绝所有请求。")
-        return False
-    return str(chat_id) == str(config.OWNER_ID)
-
-# --- Handlers ---
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    chat_id = update.effective_chat.id
-    if not _is_authorized(chat_id):
-        await update.message.reply_text("未授权。仅限 OWNER 使用。")
-        return
-    logger.info(f"User {user.first_name} started the bot. Chat ID: {chat_id}")
-    await update.message.reply_text(
-        f"你好，{user.first_name}。\n我是 Amaya 原型机。\nID: `{chat_id}`",
-        parse_mode='Markdown'
-    )
-
-async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not _is_authorized(update.effective_chat.id):
-        await update.message.reply_text("未授权。仅限 OWNER 使用。")
-        return
-    await update.message.reply_text("Pong! 系统在线。")
-
-async def reminders(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """查看挂起的提醒任务"""
-    if not _is_authorized(update.effective_chat.id):
-        await update.message.reply_text("未授权。仅限 OWNER 使用。")
-        return
-    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
-    summary = get_pending_reminders_summary() # 确保 utils/storage.py 里有这个函数
-    keyboard = [
-        [InlineKeyboardButton("刷新", callback_data='refresh_reminders')],
-        [InlineKeyboardButton("关闭", callback_data='close_reminders')]
-    ]
-    await update.message.reply_text(summary, reply_markup=InlineKeyboardMarkup(keyboard))
-
-async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    if not _is_authorized(query.from_user.id):
-        await query.edit_message_text("未授权。")
-        return
-    if query.data == 'refresh_reminders':
-        summary = get_pending_reminders_summary()
-        keyboard = [
-            [InlineKeyboardButton("刷新", callback_data='refresh_reminders')],
-            [InlineKeyboardButton("关闭", callback_data='close_reminders')]
-        ]
-        try:
-            await query.edit_message_text(text=summary, reply_markup=InlineKeyboardMarkup(keyboard))
-        except Exception as e:
-            # 内容未变时 Telegram API 会抛出异常，这是预期行为
-            logger.debug(f"编辑消息未变更: {e}")
-    elif query.data == 'close_reminders':
-        await query.delete_message()
-
-async def chat_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_text = update.message.text
-    chat_id = update.effective_chat.id
-
-    if not _is_authorized(chat_id):
-        await update.message.reply_text("未授权。仅限 OWNER 使用。")
-        return
-
-    await context.bot.send_chat_action(chat_id=chat_id, action="typing")
-    response_text = await amaya.chat(user_text)
-    await context.bot.send_chat_action(chat_id=chat_id, action="typing")
-
-    logger.info(f"Amaya 回复: {response_text[:50]}...")
-
-    try:
-        await update.message.reply_text(response_text, parse_mode='Markdown')
-    except Exception as e:
-        logger.warning(f"Markdown 发送失败，回退纯文本: {e}")
-        try:
-            await update.message.reply_text(response_text)
-        except Exception as send_err:
-            logger.error(f"消息发送彻底失败: {send_err}")
-
-async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not _is_authorized(update.effective_chat.id):
-        await update.message.reply_text("未授权。仅限 OWNER 使用。")
-        return
-    try:
-        photo = update.message.photo[-1]
-        file = await context.bot.get_file(photo.file_id)
-        image_bytes = await file.download_as_bytearray()
-    except Exception as e:
-        logger.error(f"图片下载失败: {e}")
-        await update.message.reply_text("抱歉，图片下载失败，请重试。")
-        return
-
-    caption = update.message.caption or "用户发来了一张图片"
-
-    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
-    response_text = await amaya.chat(caption, image_bytes=bytes(image_bytes))
-
-    try:
-        await update.message.reply_text(response_text, parse_mode='Markdown')
-    except Exception as e:
-        logger.warning(f"Markdown 发送失败，回退纯文本: {e}")
-        try:
-            await update.message.reply_text(response_text)
-        except Exception as send_err:
-            logger.error(f"消息发送彻底失败: {send_err}")
 
 # --- 维护任务 ---
 async def maintenance_job():
     """后台任务：触发 Amaya 自主整理"""
-    if config.OWNER_ID:
-        report = await amaya.tidying_up()
-        logger.info(f"Maintenance Report: {report}")
+    report = await amaya.tidying_up()
+    logger.info(f"Maintenance Report: {report}")
+
 
 # --- 主程序入口 ---
-if __name__ == '__main__':
-    # 1. 初始化调度器
+if __name__ == "__main__":
+    # 1. 初始化调度器 (平台无关)
     scheduler = AsyncIOScheduler()
 
     # 2. 启动钩子
     async def on_startup(app):
-        # 初始化自定义调度逻辑
-        reminder_scheduler = ReminderScheduler(scheduler, app.bot)
+        # 创建消息发送器 (Telegram 实现)
+        sender = TelegramSender(app.bot)
+
+        # 初始化提醒调度器 (注入抽象发送器，而非具体 bot)
+        reminder_scheduler = ReminderScheduler(scheduler, sender)
 
         # 启动调度器
         scheduler.start()
         logger.info("[Init] 调度器已启动")
 
-        if config.OWNER_ID:
-            now = datetime.datetime.now()
+        now = datetime.datetime.now()
 
-            # 立即恢复任务
-            scheduler.add_job(reminder_scheduler.restore_reminders, 'date', run_date=now + datetime.timedelta(seconds=1))
+        # 立即恢复任务
+        scheduler.add_job(
+            reminder_scheduler.restore_reminders,
+            "date",
+            run_date=now + datetime.timedelta(seconds=1),
+        )
 
-            # 监听系统总线
-            scheduler.add_job(reminder_scheduler.check_system_events, 'interval', seconds=config.EVENT_BUS_CHECK_INTERVAL)
+        # 监听系统总线
+        scheduler.add_job(
+            reminder_scheduler.check_system_events,
+            "interval",
+            seconds=config.EVENT_BUS_CHECK_INTERVAL,
+        )
 
-            # 定期整理
-            scheduler.add_job(maintenance_job, 'interval', hours=config.MAINTENANCE_INTERVAL_HOURS)
+        # 定期整理
+        scheduler.add_job(
+            maintenance_job,
+            "interval",
+            hours=config.MAINTENANCE_INTERVAL_HOURS,
+        )
 
     # 3. 关闭钩子
     async def on_shutdown(app):
         logger.info("正在关闭 Amaya...")
-        # 保存 Amaya 状态（短期记忆等）
         amaya.shutdown()
-        # 关闭调度器
         if scheduler.running:
             scheduler.shutdown(wait=False)
         logger.info("Amaya 已安全关闭")
 
-    # 4. 构建 App
-    application = (
-        ApplicationBuilder()
-        .token(config.TOKEN)
-        .post_init(on_startup)
-        .post_shutdown(on_shutdown)
-        .build()
-    )
+    # 4. 构建 App（传入钩子）
+    application = build_application(post_init=on_startup, post_shutdown=on_shutdown)
 
-    # 5. 注册 Handlers
-    application.add_handler(CommandHandler('start', start))
-    application.add_handler(CommandHandler('ping', ping))
-    application.add_handler(CommandHandler('reminders', reminders))
-    application.add_handler(CallbackQueryHandler(handle_callback))
-    application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), chat_handler))
-    application.add_handler(MessageHandler(filters.PHOTO, photo_handler))
+    # 5. 注册 handlers
+    register_handlers(application)
 
     logger.info("Agent 正在启动...")
     application.run_polling(stop_signals=None)
