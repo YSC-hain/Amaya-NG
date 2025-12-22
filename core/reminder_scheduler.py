@@ -4,6 +4,7 @@ import json
 import logging
 import time
 import datetime
+import secrets
 import pytz
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.date import DateTrigger
@@ -13,6 +14,13 @@ from utils.storage import load_json, save_json
 import config
 
 logger = logging.getLogger("Amaya")
+
+
+def _build_reminder_id(run_at: float) -> str:
+    """基于时间戳和随机熵生成短 ID，避免同秒冲突。"""
+    ts_part = format(int(run_at * 1000), 'x')[-8:]
+    rand_part = secrets.token_hex(3)
+    return f"r{ts_part}{rand_part}"
 
 class ReminderScheduler:
     def __init__(self, scheduler: AsyncIOScheduler, bot):
@@ -106,10 +114,13 @@ class ReminderScheduler:
 
         for event in events_to_process:
             if event.get("type") == "reminder":
-                run_at = event["run_at"]
-                prompt = event["prompt"]
-                # 构造唯一ID
-                job_id = f"reminder_{int(run_at)}"
+                run_at = event.get("run_at")
+                prompt = event.get("prompt")
+                if run_at is None or prompt is None:
+                    logger.warning("reminder 事件缺少 run_at 或 prompt，已跳过")
+                    continue
+                # 使用事件内的 ID，若缺失则生成一个
+                job_id = event.get("id") or _build_reminder_id(run_at)
 
                 if run_at > time.time():
                     run_date = datetime.datetime.fromtimestamp(run_at, tz=self.timezone)

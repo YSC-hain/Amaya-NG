@@ -109,7 +109,7 @@ class AmayaBrain:
         return f"Current Time: {now.strftime('%Y-%m-%d %A %H:%M')}"
 
 
-    async def chat(self, user_text: str, image_bytes: bytes = None) -> str:
+    async def chat(self, user_text: str, image_bytes: bytes = b'') -> str:
         # 动态选择模型
         # 如果涉及规划、反思、大量文件操作，切换到 Smart 模型
         logic_keywords = ["规划", "计划", "安排", "整理", "复盘", "反思", "分析", "schedule", "plan"]

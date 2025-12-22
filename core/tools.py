@@ -2,7 +2,11 @@
 import json
 import time
 import logging
-from typing import List
+import secrets
+import datetime
+import pytz
+from typing import List, Optional
+import config
 from utils.storage import (
     list_files_in_memory,
     read_file_content,
@@ -66,26 +70,68 @@ def pin_memory(filename: str, is_pinned: bool = True) -> str:
 
 SYS_EVENT_FILE = "data/sys_event_bus.jsonl"  # 保持不变
 
-def schedule_reminder(delay_seconds: int, prompt: str) -> str:  # ToDo: 优化参数格式(例如加入字符串格式的时间)以便于LLM计算
+def _build_reminder_id(run_at: float) -> str:
+    """基于时间戳和随机熵生成短 ID，避免同秒冲突。"""
+    ts_part = format(int(run_at * 1000), 'x')[-8:]
+    rand_part = secrets.token_hex(3)
+    return f"r{ts_part}{rand_part}"
+
+
+def _parse_target_time(target_time: str, tz: pytz.BaseTzInfo) -> Optional[float]:
+    try:
+        dt = datetime.datetime.fromisoformat(target_time)
+    except ValueError:
+        return None
+
+    if dt.tzinfo is None:
+        dt = tz.localize(dt)
+    else:
+        dt = dt.astimezone(tz)
+    return dt.timestamp()
+
+
+def schedule_reminder(delay_seconds: Optional[int] = None, prompt: str = "", target_time: Optional[str] = None) -> str:
     """
-    设置一个reminder
+    设置一个 reminder。
 
     Args:
-        delay_seconds: 延迟多少秒
-        prompt: 提醒时要执行的指令
+        delay_seconds: 延迟多少秒后触发；与 target_time 互斥，target_time 优先。
+        prompt: 提醒时要执行的指令。
+        target_time: 绝对时间（ISO 8601，如 "2025-12-23T08:00:00"，可省略 "T"）。
     """
+    if not prompt:
+        return "缺少 prompt。"
+
+    tz = pytz.timezone(config.TIMEZONE)
+    now = time.time()
+    run_at = None
+
+    if target_time:
+        run_at = _parse_target_time(target_time, tz)
+        if run_at is None:
+            return "target_time 解析失败，请使用 ISO 格式，如 2025-12-23T08:00:00。"
+        delay_seconds = max(0, int(run_at - now))
+    elif delay_seconds is not None:
+        delay_seconds = max(0, int(delay_seconds))
+        run_at = now + delay_seconds
+    else:
+        return "请提供 delay_seconds 或 target_time。"
+
+    reminder_id = _build_reminder_id(run_at)
     event = {
         "type": "reminder",
-        "created_at": time.time(),
-        "run_at": time.time() + delay_seconds,
+        "id": reminder_id,
+        "created_at": now,
+        "run_at": run_at,
         "prompt": prompt
     }
 
     try:
         with open(SYS_EVENT_FILE, 'a', encoding='utf-8') as f:
             f.write(json.dumps(event, ensure_ascii=False) + "\n")
-        logger.debug(f"已创建提醒: {delay_seconds}秒后 - {prompt}")
-        return f"指令已下达：{delay_seconds}秒后执行 '{prompt}'。"
+        human_time = datetime.datetime.fromtimestamp(run_at, tz=tz).strftime("%m-%d %H:%M:%S")
+        logger.debug(f"已创建提醒 {reminder_id}: {prompt} @ {human_time}")
+        return f"指令已下达（ID: {reminder_id}）：计划 {delay_seconds} 秒后 / {human_time} 执行 '{prompt}'。"
     except IOError as e:
         logger.error(f"写入事件总线失败: {e}")
         return f"设置失败: {str(e)}"
