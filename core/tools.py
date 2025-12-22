@@ -2,7 +2,6 @@
 import json
 import time
 import logging
-import secrets
 import datetime
 import pytz
 from typing import List, Optional
@@ -12,7 +11,8 @@ from utils.storage import (
     read_file_content,
     write_file_content,
     delete_file,
-    toggle_pin_status
+    toggle_pin_status,
+    build_reminder_id
 )
 
 logger = logging.getLogger("Amaya.Tools")
@@ -70,12 +70,6 @@ def pin_memory(filename: str, is_pinned: bool = True) -> str:
 
 SYS_EVENT_FILE = "data/sys_event_bus.jsonl"  # 保持不变
 
-def _build_reminder_id(run_at: float) -> str:
-    """基于时间戳和随机熵生成短 ID，避免同秒冲突。"""
-    ts_part = format(int(run_at * 1000), 'x')[-8:]
-    rand_part = secrets.token_hex(3)
-    return f"r{ts_part}{rand_part}"
-
 
 def _parse_target_time(target_time: str, tz: pytz.BaseTzInfo) -> Optional[float]:
     try:
@@ -117,7 +111,7 @@ def schedule_reminder(delay_seconds: Optional[int] = None, prompt: str = "", tar
     else:
         return "请提供 delay_seconds 或 target_time。"
 
-    reminder_id = _build_reminder_id(run_at)
+    reminder_id = build_reminder_id(run_at)
     event = {
         "type": "reminder",
         "id": reminder_id,

@@ -136,21 +136,22 @@ class AmayaBrain:
 {user_text}
 """
 
-            # 如果有图片，将其加入内容列表
-            input_content = [full_input]
+            # 构造 Content 对象，支持多模态输入
+            parts = [types.Part.from_text(text=full_input)]
             if image_bytes:
                 # 使用 PIL 处理字节流
                 img = PIL.Image.open(io.BytesIO(image_bytes))
-                input_content.append(img)
+                parts.append(types.Part.from_bytes(data=image_bytes, mime_type=image_bytes and f"image/{img.format.lower()}" or "image/png"))
             if audio_bytes:
-                input_content.append(types.Blob(data=audio_bytes, mime_type=audio_mime or "audio/ogg"))
+                parts.append(types.Part.from_bytes(data=audio_bytes, mime_type=audio_mime or "audio/ogg"))
 
-            # print(input_content)
-            response = chat_session.send_message(input_content)
+            # 使用 Content 包装多个 parts
+            user_content = types.Content(role="user", parts=parts)
+            response = chat_session.send_message(user_content)
             # print(response.candidates[0].content)
             response_text = ""
             for part in response.candidates[0].content.parts:
-                if hasattr(part, 'text') and part.text and part.thought is not True:
+                if hasattr(part, 'text') and part.text and not getattr(part, 'thought', False):
                     response_text += part.text
 
             # 更新短期记忆库
@@ -200,7 +201,7 @@ Task:
             response = chat_session.send_message(maintenance_prompt)
             response_text = ""
             for part in response.candidates[0].content.parts:
-                if hasattr(part, 'text') and part.text and part.thought is not True:
+                if hasattr(part, 'text') and part.text and not getattr(part, 'thought', False):
                     response_text += part.text
 
             return f"整理报告: {response_text}"

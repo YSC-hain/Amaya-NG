@@ -9,6 +9,15 @@ from typing import Any, Optional, List
 
 logger = logging.getLogger("Amaya.Storage")
 
+
+def build_reminder_id(run_at: float) -> str:
+    """基于时间戳和随机熵生成短 ID，避免同秒冲突。"""
+    import secrets
+    ts_part = format(int(run_at * 1000), 'x')[-8:]
+    rand_part = secrets.token_hex(3)
+    return f"r{ts_part}{rand_part}"
+
+
 # 全局文件锁，防止并发读写
 _file_locks: dict[str, threading.Lock] = {}
 _locks_lock = threading.Lock()  # 保护 _file_locks 的锁
@@ -174,7 +183,7 @@ def get_pending_reminders_summary():
     if not reminders:
         return "无挂起的提醒任务。"
 
-    summary = ['以下是提醒任务列表']
+    summary = []
     now = time.time()
     for reminder in reminders:
         reminder_id = reminder.get('id', '')
@@ -191,7 +200,9 @@ def get_pending_reminders_summary():
                 time_str = dt.strftime("%m-%d %H:%M")
             summary.append(f"- (ID: {reminder_id}) {prompt} (执行时间: {time_str})")
 
-    return "\n".join(summary) if summary else "无挂起的提醒任务。"
+    if not summary:
+        return "无挂起的提醒任务。"
+    return "以下是提醒任务列表\n" + "\n".join(summary)
 
 def get_global_context_string():
     """
