@@ -230,27 +230,27 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _is_authorized(update.effective_chat.id):
         await update.message.reply_text("未授权。仅限 OWNER 使用。")
         return
-    try:
-        photo = update.message.photo[-1]
-        file = await context.bot.get_file(photo.file_id)
-        image_bytes = await file.download_as_bytearray()
-    except Exception as e:
-        logger.error(f"图片下载失败: {e}")
-        await update.message.reply_text("抱歉，图片下载失败，请重试。")
-        return
-
-    caption = update.message.caption or "用户发来了一张图片"
 
     chat_id = update.effective_chat.id
     stop_event = asyncio.Event()
     spinner = asyncio.create_task(_typing_spinner(context, chat_id, stop_event))
+
+    response_text = None
     try:
+        photo = update.message.photo[-1]
+        file = await context.bot.get_file(photo.file_id)
+        image_bytes = await file.download_as_bytearray()
+        caption = update.message.caption or "用户发来了一张图片"
         response_text = await amaya.chat(caption, image_bytes=bytes(image_bytes))
+    except Exception as e:
+        logger.error(f"图片处理失败: {e}")
+        await update.message.reply_text("抱歉，图片处理失败，请重试。")
     finally:
         stop_event.set()
         await spinner
 
-    await _send_with_fallback(update.message, response_text)
+    if response_text:
+        await _send_with_fallback(update.message, response_text)
 
 
 async def voice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -268,6 +268,7 @@ async def voice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     stop_event = asyncio.Event()
     spinner = asyncio.create_task(_typing_spinner(context, chat_id, stop_event))
 
+    response_text = None
     try:
         file = await context.bot.get_file(voice.file_id)
         audio_bytes = await file.download_as_bytearray()
@@ -275,13 +276,15 @@ async def voice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         audio_bytes, mime_type = _ensure_supported_audio(bytes(audio_bytes), mime_type)
         if audio_bytes is None:
             await update.message.reply_text("当前语音格式不受支持，请以 OGG/OPUS/WEBM/WAV 重新发送。")
-            return
-
-        user_hint = "[语音消息] 用户发来了一段语音，请结合上下文提炼关键内容进行回应。"
-        response_text = await amaya.chat(user_hint, audio_bytes=audio_bytes, audio_mime=mime_type)
+        else:
+            user_hint = "[语音消息] 用户发来了一段语音，请结合上下文提炼关键内容进行回应。"
+            response_text = await amaya.chat(user_hint, audio_bytes=audio_bytes, audio_mime=mime_type)
     except TelegramError as e:
+        logger.error(f"语音下载失败: {e}")
         await update.message.reply_text(f"下载语音失败: {e}")
-        response_text = None
+    except Exception as e:
+        logger.error(f"语音处理失败: {e}")
+        await update.message.reply_text("抱歉，语音处理失败，请重试。")
     finally:
         stop_event.set()
         await spinner
