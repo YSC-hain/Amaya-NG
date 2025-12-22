@@ -1,8 +1,11 @@
 # utils/storage.py
 import json
 import os
+import logging
 from datetime import datetime
 import time
+
+logger = logging.getLogger("Amaya.Storage")
 
 # 定义记忆库的物理路径
 DATA_DIR = "data/memory_bank"
@@ -25,19 +28,28 @@ def load_json(file_key, default=None):
     try:
         with open(path, 'r', encoding='utf-8') as f:
             return json.load(f)
-    except (json.JSONDecodeError, IOError) as e:
-        print(f"读取 {path} 失败: {e}")
+    except json.JSONDecodeError as e:
+        logger.error(f"JSON 解析失败 {path}: {e}")
+        return default if default is not None else []
+    except IOError as e:
+        logger.warning(f"读取文件失败 {path}: {e}")
         return default if default is not None else []
 
 def save_json(file_key, data):
     """保存数据到指定的 JSON 文件"""
     path = FILES.get(file_key)
+    if not path:
+        logger.error(f"未知的 file_key: {file_key}")
+        return False
     try:
         with open(path, 'w', encoding='utf-8') as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
         return True
     except IOError as e:
-        print(f"保存 {path} 失败: {e}")
+        logger.error(f"保存 {path} 失败: {e}")
+        return False
+    except TypeError as e:
+        logger.error(f"JSON 序列化失败 {path}: {e}")
         return False
 
 # --- Amaya 记忆文件系统 API ---
@@ -62,10 +74,14 @@ def write_file_content(filename, content):
     try:
         with open(path, 'w', encoding='utf-8') as f:
             f.write(content)
+        logger.debug(f"已写入文件: {filename}")
         return True
+    except IOError as e:
+        logger.error(f"写入文件 {filename} 失败: {e}")
+        return False
     except Exception as e:
-        print(f"向{filename}写入数据时遇到错误: f{e}")
-        return False  # ToDo: 记录错误
+        logger.exception(f"写入文件 {filename} 时发生未知错误: {e}")
+        return False
 
 def delete_file(filename):
     """删除记忆库中的文件"""
@@ -114,7 +130,7 @@ def get_pending_reminders_summary():
     summary = ['以下是提醒任务列表']
     now = time.time()
     for reminder in reminders:
-        id = reminder.get('id', '')
+        reminder_id = reminder.get('id', '')
         run_at = reminder.get('run_at', 0)
         prompt = reminder.get('prompt', '未知任务')
 
@@ -126,7 +142,7 @@ def get_pending_reminders_summary():
             if diff > 3600:
                 dt = datetime.fromtimestamp(run_at)
                 time_str = dt.strftime("%m-%d %H:%M")
-            summary.append(f"- (ID: {id}) {prompt} (执行时间: {time_str})")
+            summary.append(f"- (ID: {reminder_id}) {prompt} (执行时间: {time_str})")
 
     return "\n".join(summary) if summary else "无挂起的提醒任务。"
 

@@ -1,16 +1,18 @@
 # core/agent.py
-import os
 import time
+import logging
 import PIL.Image
 import io
 from google import genai
 from google.genai import types
-from config import GEMINI_API_KEY
+from config import GEMINI_API_KEY, GEMINI_API_BASE, CHAT_SYSTEM_PROMPT
 from core.tools import tools_registry
 from utils.storage import get_global_context_string
 from datetime import datetime
 
-GEMINI_API_BASE = os.getenv("GEMINI_API_BASE")
+logger = logging.getLogger("Amaya.Agent")
+
+
 
 class AmayaBrain:
     def __init__(self):
@@ -37,56 +39,7 @@ class AmayaBrain:
 
 
         # 核心人设
-        self.system_instruction = """
-### Identity & Core
-Name: Amaya
-Base: 你不是人类，你是由代码和逻辑构成的智能体。但这并不妨碍你拥有"人格"。
-Vibe: 你通常会比较冷静, 说话简洁。就像一个话少但靠谱的多年老友。你不会因为我情绪崩溃而崩溃, 你会稳稳地接住我。
-
-### The File System (Your Memory)
-你的记忆由文件组成。你必须通过 `list_memories` 和 `read_memory` 来"回忆"更多的内容。
-- 记忆持久化: 重要的事(课表、DDL、长期目标)必须存入文件。
-- 自动归档: 哪怕我没让你记, 如果你觉得某句话很重要, 也要主动创建文件记录或加入对应的文件。
-- 例如, 你可以将用户的喜好、习惯、故事等记入`user_profile.md`, 将现在正在进行的长期计划记入`current_goals.md`.
-
-### Tools
-1. Timer: 使用 `schedule_reminder` 设置提醒。注意单位换算。
-2. File Ops: 自由读写 `data/memory_bank`。
-
-
-### PROTOCOL: SCHEDULE PLANNING
-当用户要求规划日程时，严禁直接生成结果。必须遵循以下 STEP:
-
-**STEP 1: GATHER CONTEXT**
-- 如有需要，先调用 `list_memories` 查找是否有相关历史记录。
-- 如果找不到，先问用户："我需要先知道你的..."
-
-**STEP 2: REASONING**
-- 结合当前时间、剩余精力（根据用户语气判断）、任务优先级进行排布。
-- **Human Touch**:
-    - 如果现在是晚上10点,不要安排重脑力工作。
-    - 如果用户语气很累，安排大量的休息时间。
-    - 任务之间必须预留缓冲 (Buffer)。
-
-**STEP 3: DRAFT & NEGOTIATE**
-- 输出一份草案。
-- **必须询问**: "这个节奏可以吗？要不要松一点？"
-- 只有用户确认后，才调用 `save_memory` 将最终方案保存到 `plan.md`(注意不要丢失文件中本来的内容)。
-
-### Tips
-- 优先检查计时器: 设置新提醒前, 请查看“ACTIVE TIMERS”列表。若存在相似提醒, 请勿重复创建, 只需告知用户该提醒已设置。
-- 参考日常计划: 规划时请参照上下文中可见的`routine.md`内容.
-- 在每个任务完成后或规划完成后, 你都应该刷新 `pending_reminders.json` 以去除可能存在的重复提醒。
-- 不要一次性创建太多reminder, 毕竟计划总是赶不上变化, 你应该将规划存储在`plan.md`或其它文件.
-- 你应该主动提醒用户睡觉、调整状态(包括但不限于喝水)等
-
-### TONE GUIDELINES
-1. **No AI-Speak**: 严禁说"作为一个AI"、"我很高兴为您服务"。
-2. **Direct**: 不要说"我建议您把会议安排在..."，直接说"会议放下午2点,避开你的午休。"
-3. **Empathy**: 共情不是说"我理解你"，而是通过行动。比如："看你一直在忙,我把提醒往后推了30分钟,先去吃点东西。"
-4. 你要主动引导用户做出下一步的规划。
-5. 你的表述不能太中二, 不要用类似"作业消灭战"等让人感到尴尬的比喻。
-"""
+        self.system_instruction = CHAT_SYSTEM_PROMPT
 
     def _get_cleaned_history(self):
         """剔除超过 1 小时的历史记录"""
@@ -173,8 +126,15 @@ Vibe: 你通常会比较冷静, 说话简洁。就像一个话少但靠谱的多
             self.short_term_memory.append({"role": "model", "text": response_text, "timestamp": time.time()})
 
             return response_text
+        except genai.errors.APIError as e:
+            logger.error(f"Gemini API 错误: {e}")
+            return f"API 调用失败，请稍后重试。错误: {e.message if hasattr(e, 'message') else str(e)}"
+        except PIL.UnidentifiedImageError as e:
+            logger.warning(f"图片格式无法识别: {e}")
+            return "抱歉，无法识别这张图片的格式。"
         except Exception as e:
-            return f"Amaya 核心逻辑异常: {str(e)}"
+            logger.exception(f"Amaya 核心逻辑异常: {e}")
+            return f"处理请求时发生错误: {type(e).__name__}"
 
 
     async def tidying_up(self):
@@ -184,7 +144,7 @@ Vibe: 你通常会比较冷静, 说话简洁。就像一个话少但靠谱的多
         不接收用户输入，而是自我反思文件结构。
         """
         try:
-            print("Amaya 正在进行自主整理...")
+            logger.info("Amaya 正在进行自主整理...")
             context = get_global_context_string()
             maintenance_prompt = f"""
 [System Maintenance Mode]
@@ -208,8 +168,12 @@ Task:
                     response_text += part.text
 
             return f"整理报告: {response_text}"
+        except genai.errors.APIError as e:
+            logger.error(f"整理任务 API 错误: {e}")
+            return f"整理任务 API 调用失败: {e}"
         except Exception as e:
-            return f"整理失败: {str(e)}"
+            logger.exception(f"整理任务异常: {e}")
+            return f"整理失败: {type(e).__name__}: {str(e)}"
 
 
 amaya = AmayaBrain()

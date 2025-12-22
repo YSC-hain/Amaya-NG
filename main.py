@@ -59,8 +59,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ]
         try:
             await query.edit_message_text(text=summary, reply_markup=InlineKeyboardMarkup(keyboard))
-        except Exception as _:
-            pass # 内容未变时不报错
+        except Exception as e:
+            # 内容未变时 Telegram API 会抛出异常，这是预期行为
+            logger.debug(f"编辑消息未变更: {e}")
     elif query.data == 'close_reminders':
         await query.delete_message()
 
@@ -81,13 +82,22 @@ async def chat_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await update.message.reply_text(response_text, parse_mode='Markdown')
     except Exception as e:
-        logger.warning(f"Markdown 发送失败: {e}")
-        await update.message.reply_text(response_text)
+        logger.warning(f"Markdown 发送失败，回退纯文本: {e}")
+        try:
+            await update.message.reply_text(response_text)
+        except Exception as send_err:
+            logger.error(f"消息发送彻底失败: {send_err}")
 
 async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    photo = update.message.photo[-1]
-    file = await context.bot.get_file(photo.file_id)
-    image_bytes = await file.download_as_bytearray()
+    try:
+        photo = update.message.photo[-1]
+        file = await context.bot.get_file(photo.file_id)
+        image_bytes = await file.download_as_bytearray()
+    except Exception as e:
+        logger.error(f"图片下载失败: {e}")
+        await update.message.reply_text("抱歉，图片下载失败，请重试。")
+        return
+
     caption = update.message.caption or "用户发来了一张图片"
 
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
@@ -95,8 +105,12 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         await update.message.reply_text(response_text, parse_mode='Markdown')
-    except Exception as _:
-        await update.message.reply_text(response_text)
+    except Exception as e:
+        logger.warning(f"Markdown 发送失败，回退纯文本: {e}")
+        try:
+            await update.message.reply_text(response_text)
+        except Exception as send_err:
+            logger.error(f"消息发送彻底失败: {send_err}")
 
 # --- 维护任务 ---
 async def maintenance_job():

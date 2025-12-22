@@ -74,6 +74,7 @@ class ReminderScheduler:
             return
 
         events_to_process = []
+        lines_to_keep = []  # 解析失败的行，需要保留
         try:
             # 读写模式打开，读取后清空
             with open(sys_bus_path, 'r+', encoding='utf-8') as f:
@@ -85,9 +86,22 @@ class ReminderScheduler:
 
             for line in lines:
                 if line.strip():
-                    events_to_process.append(json.loads(line))
+                    try:
+                        events_to_process.append(json.loads(line))
+                    except json.JSONDecodeError as e:
+                        logger.warning(f"事件解析失败，保留原数据: {e}")
+                        lines_to_keep.append(line)
+
+            # 将解析失败的行写回文件
+            if lines_to_keep:
+                with open(sys_bus_path, 'a', encoding='utf-8') as f:
+                    f.writelines(lines_to_keep)
+
+        except IOError as e:
+            logger.error(f"总线文件读写失败: {e}")
+            return
         except Exception as e:
-            logger.error(f"总线读取失败: {e}")
+            logger.exception(f"总线处理异常: {e}")
             return
 
         for event in events_to_process:
@@ -115,11 +129,17 @@ class ReminderScheduler:
 
             elif event.get("type") == "clear_reminder":
                 # 支持删除提醒
-                reminder_id = event["reminder_id"]
-                if self.scheduler.get_job(reminder_id):
-                    self.scheduler.remove_job(reminder_id)
-                self.update_pending_reminders(reminder_id, 0, "", remove=True)
-                logger.info(f"已清除提醒任务: {reminder_id}")
+                reminder_id = event.get("reminder_id")
+                if not reminder_id:
+                    logger.warning("clear_reminder 事件缺少 reminder_id")
+                    continue
+                try:
+                    if self.scheduler.get_job(reminder_id):
+                        self.scheduler.remove_job(reminder_id)
+                    self.update_pending_reminders(reminder_id, 0, "", remove=True)
+                    logger.info(f"已清除提醒任务: {reminder_id}")
+                except Exception as e:
+                    logger.error(f"清除提醒任务 {reminder_id} 失败: {e}")
 
     def update_pending_reminders(self, reminder_id, run_at, prompt, remove=False):
         """维护pending_reminders.json"""
@@ -127,7 +147,7 @@ class ReminderScheduler:
         if remove:
             reminders = [j for j in reminders if j.get("id") != reminder_id]
         else:
-            # 先删除旧的同ID记录（防止重复），再添加新的
+            # 先删除旧的同ID记录（防止重复），再添加新的   ToDo: 激进的删除策略可能造成影响
             reminders = [j for j in reminders if j.get("id") != reminder_id]
             reminders.append({"id": reminder_id, "run_at": run_at, "prompt": prompt})
         save_json("pending_reminders", reminders)
