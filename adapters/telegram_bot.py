@@ -15,7 +15,7 @@ from telegram.ext import (
     CallbackQueryHandler,
     filters,
 )
-from telegram.error import TelegramError
+from telegram.error import TelegramError, NetworkError
 
 import config
 from adapters.base import MessageSender
@@ -85,17 +85,33 @@ def _is_authorized(chat_id: int) -> bool:
     return str(chat_id) == str(config.OWNER_ID)
 
 
-async def _typing_spinner(context: ContextTypes.DEFAULT_TYPE, chat_id: int, stop_event: asyncio.Event, interval: int = 4):
-    """循环发送 typing，直至 stop_event 触发。"""
+async def _typing_spinner(context: ContextTypes.DEFAULT_TYPE, chat_id: int, stop_event: asyncio.Event, interval: float = 3.0):
+    """
+    循环发送 typing 状态，直至 stop_event 触发。
+    Telegram 的 typing 状态持续约 5 秒，所以我们每 3 秒刷新一次。
+    """
     try:
-        while not stop_event.is_set():
+        # 立即发送第一次 typing（不等待）
+        try:
             await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+        except (TelegramError, NetworkError) as e:
+            logger.debug(f"首次 typing 发送失败: {e}")
+
+        while not stop_event.is_set():
             try:
+                # 等待 stop_event 或超时
                 await asyncio.wait_for(stop_event.wait(), timeout=interval)
+                break  # stop_event 被设置，退出循环
             except asyncio.TimeoutError:
-                continue
+                # 超时，发送下一次 typing
+                try:
+                    await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+                except (TelegramError, NetworkError) as e:
+                    logger.debug(f"typing 发送失败: {e}")
     except asyncio.CancelledError:
-        return
+        pass
+    except Exception as e:
+        logger.debug(f"typing spinner 异常: {e}")
 
 
 # --- Telegram MessageSender 实现 ---
@@ -216,14 +232,29 @@ async def chat_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     stop_event = asyncio.Event()
     spinner = asyncio.create_task(_typing_spinner(context, chat_id, stop_event))
+
+    # 让出控制权，确保 spinner 立即开始执行
+    await asyncio.sleep(0)
+
+    response_text = None
     try:
-        response_text = await amaya.chat(user_text)
+        # 使用 to_thread 在线程池中运行阻塞的 Gemini 调用
+        # 这样 typing spinner 可以继续在主事件循环中运行
+        response_text = await asyncio.to_thread(amaya.chat_sync, user_text)
+    except Exception as e:
+        logger.error(f"聊天处理异常: {e}")
+        response_text = "抱歉，处理消息时发生错误，请稍后重试。"
     finally:
         stop_event.set()
-        await spinner
+        # 给 spinner 一点时间优雅退出
+        try:
+            await asyncio.wait_for(spinner, timeout=1.0)
+        except asyncio.TimeoutError:
+            spinner.cancel()
 
-    logger.info(f"Amaya 回复: {response_text[:50]}...")
-    await _send_with_fallback(update.message, response_text)
+    if response_text:
+        logger.info(f"Amaya 回复: {response_text[:50]}...")
+        await _send_with_fallback(update.message, response_text)
 
 
 async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -234,6 +265,7 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     stop_event = asyncio.Event()
     spinner = asyncio.create_task(_typing_spinner(context, chat_id, stop_event))
+    await asyncio.sleep(0)  # 让出控制权
 
     response_text = None
     try:
@@ -241,13 +273,19 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         file = await context.bot.get_file(photo.file_id)
         image_bytes = await file.download_as_bytearray()
         caption = update.message.caption or "用户发来了一张图片"
-        response_text = await amaya.chat(caption, image_bytes=bytes(image_bytes))
+        # 使用 to_thread 在线程池中运行阻塞的 Gemini 调用
+        response_text = await asyncio.to_thread(
+            amaya.chat_sync, caption, image_bytes=bytes(image_bytes)
+        )
     except Exception as e:
         logger.error(f"图片处理失败: {e}")
-        await update.message.reply_text("抱歉，图片处理失败，请重试。")
+        response_text = "抱歉，图片处理失败，请重试。"
     finally:
         stop_event.set()
-        await spinner
+        try:
+            await asyncio.wait_for(spinner, timeout=1.0)
+        except asyncio.TimeoutError:
+            spinner.cancel()
 
     if response_text:
         await _send_with_fallback(update.message, response_text)
@@ -267,6 +305,7 @@ async def voice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     stop_event = asyncio.Event()
     spinner = asyncio.create_task(_typing_spinner(context, chat_id, stop_event))
+    await asyncio.sleep(0)  # 让出控制权
 
     response_text = None
     try:
@@ -278,16 +317,22 @@ async def voice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("当前语音格式不受支持，请以 OGG/OPUS/WEBM/WAV 重新发送。")
         else:
             user_hint = "[语音消息] 用户发来了一段语音，请结合上下文提炼关键内容进行回应。"
-            response_text = await amaya.chat(user_hint, audio_bytes=audio_bytes, audio_mime=mime_type)
+            # 使用 to_thread 在线程池中运行阻塞的 Gemini 调用
+            response_text = await asyncio.to_thread(
+                amaya.chat_sync, user_hint, audio_bytes=audio_bytes, audio_mime=mime_type
+            )
     except TelegramError as e:
         logger.error(f"语音下载失败: {e}")
         await update.message.reply_text(f"下载语音失败: {e}")
     except Exception as e:
         logger.error(f"语音处理失败: {e}")
-        await update.message.reply_text("抱歉，语音处理失败，请重试。")
+        response_text = "抱歉，语音处理失败，请重试。"
     finally:
         stop_event.set()
-        await spinner
+        try:
+            await asyncio.wait_for(spinner, timeout=1.0)
+        except asyncio.TimeoutError:
+            spinner.cancel()
 
     if response_text:
         await _send_with_fallback(update.message, response_text)

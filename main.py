@@ -37,7 +37,14 @@ async def maintenance_job():
 # --- 主程序入口 ---
 if __name__ == "__main__":
     # 1. 初始化调度器 (平台无关)
-    scheduler = AsyncIOScheduler()
+    # 设置 misfire_grace_time 允许任务在错过时间后 60 秒内仍然执行
+    # 设置 coalesce=True 合并多次错过的执行为一次
+    scheduler = AsyncIOScheduler(
+        job_defaults={
+            'misfire_grace_time': 60,
+            'coalesce': True
+        }
+    )
 
     # 2. 启动钩子
     async def on_startup(app):
