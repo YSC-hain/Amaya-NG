@@ -10,18 +10,38 @@ logger = logging.getLogger("Amaya.Config")
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 OWNER_ID = os.getenv("OWNER_ID")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-GEMINI_API_BASE = os.getenv("GEMINI_API_BASE")
+
+# --- LLM 提供者配置 ---
+# 支持 "gemini" 或 "openai"
+LLM_PROVIDER = os.getenv("LLM_PROVIDER", "gemini").lower()
+
+# Gemini 配置
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+GEMINI_API_BASE = os.getenv("GEMINI_API_BASE", "")
+GEMINI_SMART_MODEL = os.getenv("GEMINI_SMART_MODEL", "gemini-2.5-pro")
+GEMINI_FAST_MODEL = os.getenv("GEMINI_FAST_MODEL", "gemini-2.5-flash")
+
+# OpenAI 配置
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+OPENAI_API_BASE = os.getenv("OPENAI_API_BASE", "")  # 第三方 Base URL
+OPENAI_SMART_MODEL = os.getenv("OPENAI_SMART_MODEL", "gpt-5.2")
+OPENAI_FAST_MODEL = os.getenv("OPENAI_FAST_MODEL", "gpt-5.1  ")
 
 
+# --- 验证配置 ---
 if not TOKEN:
     raise ValueError("错误：未找到 TELEGRAM_BOT_TOKEN，请检查 .env 文件！")
 
-if not GEMINI_API_KEY:
-    raise ValueError("错误：未找到 GEMINI_API_KEY！")
-
 if not OWNER_ID:
     raise ValueError("错误：未配置 OWNER_ID。当前版本仅支持单一授权用户，请在 .env 中设置 OWNER_ID。")
+
+# 根据选择的提供者验证 API Key
+if LLM_PROVIDER == "gemini" and not GEMINI_API_KEY:
+    raise ValueError("错误：选择了 Gemini 但未找到 GEMINI_API_KEY！")
+elif LLM_PROVIDER == "openai" and not OPENAI_API_KEY:
+    raise ValueError("错误：选择了 OpenAI 但未找到 OPENAI_API_KEY！")
+elif LLM_PROVIDER not in ("gemini", "openai"):
+    raise ValueError(f"错误：不支持的 LLM_PROVIDER: {LLM_PROVIDER}。支持: gemini, openai")
 
 
 # --- 调度配置 ---
@@ -30,9 +50,9 @@ MAINTENANCE_INTERVAL_HOURS = 8  # 自动整理间隔（小时）
 SHORT_TERM_MEMORY_TTL = 10800  # 短期记忆过期时间（秒）
 TIMEZONE = "Asia/Shanghai"  # 时区
 
-# --- 模型配置 ---
-SMART_MODEL = "gemini-2.5-pro"
-FAST_MODEL = "gemini-2.5-flash"
+# --- 模型配置（兼容旧代码，实际从上方配置读取）---
+SMART_MODEL = GEMINI_SMART_MODEL if LLM_PROVIDER == "gemini" else OPENAI_SMART_MODEL
+FAST_MODEL = GEMINI_FAST_MODEL if LLM_PROVIDER == "gemini" else OPENAI_FAST_MODEL
 
 
 CHAT_SYSTEM_PROMPT = """

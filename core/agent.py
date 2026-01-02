@@ -1,44 +1,58 @@
 # core/agent.py
+"""
+Amaya Brain - 核心 Agent 逻辑
+使用 LLM 抽象层，支持多种 LLM 后端
+"""
+
 import time
 import logging
-import PIL.Image
-import io
-from google import genai
-from google.genai import types
+from datetime import datetime
+
 import config
+from core.llm import create_llm_provider, ChatMessage, MultimodalInput
 from core.tools import tools_registry
 from utils.storage import get_global_context_string, load_json, save_json
-from datetime import datetime
 
 logger = logging.getLogger("Amaya.Agent")
 
 
 class AmayaBrain:
     def __init__(self):
-        # 1. 配置 HTTP 选项 (代理)
-        http_options = None
-        if config.GEMINI_API_BASE:
-            http_options = types.HttpOptions(
-                base_url=config.GEMINI_API_BASE,
-                api_version="v1beta"
-            )
+        # 1. 根据配置创建 LLM 提供者
+        self._init_llm_provider()
 
-        # 2. 初始化客户端
-        self.client = genai.Client(
-            api_key=config.GEMINI_API_KEY,
-            http_options=http_options
-        )
-
-        self.smart_model = config.SMART_MODEL
-        self.fast_model = config.FAST_MODEL
-
-        # 3. 短期记忆缓存
+        # 2. 短期记忆缓存
         # 结构: [{"role": "user/model", "text": "...", "timestamp": 123456789}]
         self.short_term_memory = self._load_short_term_memory()
 
         # 核心人设
         self.system_instruction = config.CHAT_SYSTEM_PROMPT
         self.maintenance_instruction = config.MAINTENANCE_SYSTEM_PROMPT
+
+    def _init_llm_provider(self):
+        """根据配置初始化 LLM 提供者"""
+        provider_type = config.LLM_PROVIDER
+
+        if provider_type == "gemini":
+            self.llm = create_llm_provider(
+                provider_type="gemini",
+                api_key=config.GEMINI_API_KEY,
+                smart_model=config.GEMINI_SMART_MODEL,
+                fast_model=config.GEMINI_FAST_MODEL,
+                api_base=config.GEMINI_API_BASE or None
+            )
+        elif provider_type == "openai":
+            self.llm = create_llm_provider(
+                provider_type="openai",
+                api_key=config.OPENAI_API_KEY,
+                smart_model=config.OPENAI_SMART_MODEL,
+                fast_model=config.OPENAI_FAST_MODEL,
+                api_base=config.OPENAI_API_BASE or None
+            )
+        else:
+            raise ValueError(f"不支持的 LLM Provider: {provider_type}")
+
+        logger.info(f"LLM Provider 初始化: {self.llm.provider_name}")
 
     def _load_short_term_memory(self) -> list:
         """从持久化存储加载短期记忆"""
@@ -72,35 +86,16 @@ class AmayaBrain:
         self._save_short_term_memory()
         logger.info("Amaya 状态已保存")
 
-    def _get_cleaned_history(self):
-        """剔除过期的历史记录"""
+    def _get_cleaned_history(self) -> list[ChatMessage]:
+        """剔除过期的历史记录，返回 ChatMessage 列表"""
         cutoff = time.time() - config.SHORT_TERM_MEMORY_TTL
         self.short_term_memory = [m for m in self.short_term_memory if m.get("timestamp", 0) > cutoff]
 
-        # 转换为 Gemini 接受的 history 格式 (不带时间戳)
-        formatted_history = []
+        # 转换为统一的 ChatMessage 格式
+        messages = []
         for m in self.short_term_memory:
-            formatted_history.append({"role": m["role"], "parts": [{"text": m["text"]}]})
-        return formatted_history
-
-
-    def _create_chat(self, use_smart_model=False, system_instruction=None, history=None, maximum_remote_calls=10):
-        """根据任务难度选择模型"""
-        model_name = self.smart_model if use_smart_model else self.fast_model
-
-        return self.client.chats.create(
-            model=model_name,
-            config=types.GenerateContentConfig(
-                system_instruction=system_instruction or self.system_instruction,
-                temperature=0.7,
-                tools=tools_registry,
-                automatic_function_calling=types.AutomaticFunctionCallingConfig(
-                    disable=False, maximum_remote_calls=maximum_remote_calls
-                )
-            ),
-            history=history
-        )
-
+            messages.append(ChatMessage.from_dict(m))
+        return messages
 
     def get_world_background(self):
         """
@@ -108,7 +103,6 @@ class AmayaBrain:
         """
         now = datetime.now()
         return f"Current Time: {now.strftime('%Y-%m-%d %A %H:%M')}"
-
 
     def chat_sync(self, user_text: str, image_bytes: bytes = b'', audio_bytes: bytes = b'', audio_mime: str = "audio/ogg") -> str:
         """
@@ -127,8 +121,6 @@ class AmayaBrain:
             # 获取并清理短期对话历史
             history = self._get_cleaned_history()
 
-            chat_session = self._create_chat(use_smart_model=use_smart, history=history)
-
             # 2. 构造 Prompt，把记忆强行塞进上下文
             full_input = f"""
 [WORLD CONTEXT]
@@ -141,24 +133,25 @@ class AmayaBrain:
 {user_text}
 """
 
-            # 构造 Content 对象，支持多模态输入
-            parts = [full_input]  # 文本可以直接作为字符串
-            if image_bytes:
-                # 使用 PIL 处理字节流
-                img = PIL.Image.open(io.BytesIO(image_bytes))
-                parts.append(img)  # PIL.Image 可以直接传入
-            if audio_bytes:
-                parts.append(types.Part.from_bytes(data=audio_bytes, mime_type=audio_mime or "audio/ogg"))
+            # 3. 构造多模态输入
+            multimodal_input = MultimodalInput(
+                text=full_input,
+                image_bytes=image_bytes,
+                audio_bytes=audio_bytes,
+                audio_mime=audio_mime
+            )
 
-            # 直接传递 parts 列表（单个元素时传元素本身）
-            message_input = parts[0] if len(parts) == 1 else parts
-            response = chat_session.send_message(message_input)
+            # 4. 调用 LLM
+            response = self.llm.chat(
+                messages=history,
+                system_instruction=self.system_instruction,
+                multimodal_input=multimodal_input,
+                tools=tools_registry,
+                use_smart_model=use_smart,
+                max_tool_calls=10
+            )
 
-            response_text = ""
-            if response.candidates and response.candidates[0].content.parts:
-                for part in response.candidates[0].content.parts:
-                    if hasattr(part, 'text') and part.text and not getattr(part, 'thought', False):
-                        response_text += part.text
+            response_text = response.text
 
             # 确保不返回空字符串
             if not response_text.strip():
@@ -173,12 +166,7 @@ class AmayaBrain:
             self._save_short_term_memory()
 
             return response_text
-        except genai.errors.APIError as e:
-            logger.error(f"Gemini API 错误: {e}")
-            return f"API 调用失败，请稍后重试。错误: {e.message if hasattr(e, 'message') else str(e)}"
-        except PIL.UnidentifiedImageError as e:
-            logger.warning(f"图片格式无法识别: {e}")
-            return "抱歉，无法识别这张图片的格式。"
+
         except Exception as e:
             logger.exception(f"Amaya 核心逻辑异常: {e}")
             return f"处理请求时发生错误: {type(e).__name__}"
@@ -192,7 +180,6 @@ class AmayaBrain:
         return await asyncio.to_thread(
             self.chat_sync, user_text, image_bytes, audio_bytes, audio_mime
         )
-
 
     async def tidying_up(self):
         """
@@ -209,23 +196,23 @@ Context:
 {context}
 """
             # 使用独立的 chat session（无历史记录）避免上下文污染
-            chat_session = self._create_chat(use_smart_model=True, system_instruction=self.system_instruction + self.maintenance_system_prompt, history=[])
-            response = chat_session.send_message(maintenance_prompt)
+            multimodal_input = MultimodalInput(text=maintenance_prompt)
 
-            response_text = ""
-            if response.candidates and response.candidates[0].content.parts:
-                for part in response.candidates[0].content.parts:
-                    if hasattr(part, 'text') and part.text and not getattr(part, 'thought', False):
-                        response_text += part.text
+            response = self.llm.chat(
+                messages=[],  # 无历史记录
+                system_instruction=self.system_instruction + self.maintenance_instruction,
+                multimodal_input=multimodal_input,
+                tools=tools_registry,
+                use_smart_model=True,
+                max_tool_calls=10
+            )
 
+            response_text = response.text
             if not response_text:
                 response_text = "System clean."
 
             return f"整理报告: {response_text}"
-        except genai.errors.APIError as e:
-            error_msg = e.message if hasattr(e, 'message') else str(e)
-            logger.error(f"整理任务 API 错误: {error_msg}")
-            return f"整理任务 API 调用失败: {error_msg}"
+
         except Exception as e:
             logger.exception(f"整理任务异常: {e}")
             return f"整理失败: {type(e).__name__}: {str(e)}"
