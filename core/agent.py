@@ -48,7 +48,6 @@ class AmayaBrain:
                 smart_model=config.OPENAI_SMART_MODEL,
                 fast_model=config.OPENAI_FAST_MODEL,
                 api_base=config.OPENAI_API_BASE or None,
-                use_responses_api=config.OPENAI_USE_RESPONSES_API,
                 reasoning_effort=config.OPENAI_REASONING_EFFORT or None
             )
         else:
