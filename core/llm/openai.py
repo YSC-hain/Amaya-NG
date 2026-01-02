@@ -1,7 +1,7 @@
 # core/llm/openai.py
 """
-OpenAI (ChatGPT) LLM Provider 实现
-支持第三方 BaseURL
+OpenAI LLM Provider 实现
+仅使用 Responses API（弃用 Chat Completions）
 """
 
 import base64
@@ -37,39 +37,29 @@ def _python_type_to_json_schema(py_type: Any) -> dict:
         return {"type": "array"}
     elif py_type is dict:
         return {"type": "object"}
-    elif hasattr(py_type, "__origin__"):  # 处理 Optional, List 等泛型
+    elif hasattr(py_type, "__origin__"):
         origin = py_type.__origin__
         if origin is list:
             return {"type": "array"}
-        # Optional[X] 实际上是 Union[X, None]
         elif str(origin) == "typing.Union":
             args = py_type.__args__
-            # 过滤掉 NoneType
             non_none_args = [a for a in args if a is not type(None)]
             if non_none_args:
                 return _python_type_to_json_schema(non_none_args[0])
-    return {"type": "string"}  # 默认返回 string
+    return {"type": "string"}
 
 
 def _convert_function_to_openai_tool(func: Callable) -> dict:
-    """
-    将 Python 函数转换为 OpenAI Function Calling 格式
-    依赖函数的 docstring 和类型注解
-    """
+    """将 Python 函数转换为 OpenAI Function Calling 格式"""
     import inspect
 
-    # 获取函数签名
     sig = inspect.signature(func)
     type_hints = get_type_hints(func) if hasattr(func, '__annotations__') else {}
 
-    # 解析 docstring
     doc = func.__doc__ or ""
     lines = doc.strip().split('\n')
-
-    # 提取描述（第一行）
     description = lines[0].strip() if lines else func.__name__
 
-    # 解析参数描述
     param_descriptions = {}
     in_args = False
     for line in lines:
@@ -84,7 +74,6 @@ def _convert_function_to_openai_tool(func: Callable) -> dict:
                 param_name, param_desc = stripped.split(":", 1)
                 param_descriptions[param_name.strip()] = param_desc.strip()
 
-    # 构建参数 schema
     properties = {}
     required = []
 
@@ -95,12 +84,9 @@ def _convert_function_to_openai_tool(func: Callable) -> dict:
         param_type = type_hints.get(param_name, str)
         param_schema = _python_type_to_json_schema(param_type)
         param_schema["description"] = param_descriptions.get(param_name, "")
-
         properties[param_name] = param_schema
 
-        # 如果没有默认值，则为必需参数
         if param.default is inspect.Parameter.empty:
-            # 检查是否是 Optional 类型
             if hasattr(param_type, "__origin__") and str(param_type.__origin__) == "typing.Union":
                 args = param_type.__args__
                 if type(None) not in args:
@@ -123,28 +109,40 @@ def _convert_function_to_openai_tool(func: Callable) -> dict:
 
 
 class OpenAIProvider(LLMProvider):
-    """OpenAI (ChatGPT) API 提供者"""
+    """OpenAI Responses API 提供者"""
 
     def __init__(
         self,
         api_key: str,
         smart_model: str = "gpt-4o",
         fast_model: str = "gpt-4o-mini",
-        api_base: Optional[str] = None
+        api_base: Optional[str] = None,
+        use_responses_api: bool = True,  # 默认启用
+        reasoning_effort: Optional[str] = None
     ):
         super().__init__(smart_model, fast_model)
 
-        # 初始化客户端
         client_kwargs = {"api_key": api_key}
         if api_base:
             client_kwargs["base_url"] = api_base
 
         self.client = OpenAI(**client_kwargs)
-        self._tools_map: dict[str, Callable] = {}  # 工具名称 -> 函数映射
+        self._tools_map: dict[str, Callable] = {}
+
+        # reasoning 配置（仅 smart 模式生效）
+        allowed_effort = {"low", "medium", "high"}
+        if reasoning_effort:
+            normalized = reasoning_effort.lower()
+            self.reasoning_effort = normalized if normalized in allowed_effort else None
+            if not self.reasoning_effort:
+                logger.warning(f"无效的 reasoning_effort: {reasoning_effort}, 将忽略")
+        else:
+            self.reasoning_effort = None
 
         logger.info(f"OpenAI Provider 初始化完成，Smart: {smart_model}, Fast: {fast_model}")
         if api_base:
             logger.info(f"使用自定义 Base URL: {api_base}")
+        logger.info("使用 Responses API")
 
     @property
     def provider_name(self) -> str:
@@ -161,14 +159,12 @@ class OpenAIProvider(LLMProvider):
         """将统一消息格式转换为 OpenAI 格式"""
         formatted = []
 
-        # 添加系统消息
         if system_instruction:
             formatted.append({
                 "role": "system",
                 "content": system_instruction
             })
 
-        # 转换历史消息
         for msg in messages:
             role = "user" if msg.role == MessageRole.USER else "assistant"
             formatted.append({
@@ -182,16 +178,13 @@ class OpenAIProvider(LLMProvider):
         """构建多模态消息内容"""
         content = []
 
-        # 添加文本
         if multimodal_input.text:
             content.append({
                 "type": "text",
                 "text": multimodal_input.text
             })
 
-        # 添加图片
         if multimodal_input.image_bytes:
-            # OpenAI 需要 base64 编码的图片
             image_b64 = base64.b64encode(multimodal_input.image_bytes).decode('utf-8')
             content.append({
                 "type": "image_url",
@@ -200,27 +193,23 @@ class OpenAIProvider(LLMProvider):
                 }
             })
 
-        # 注意：OpenAI 的音频处理方式不同，这里简化处理
         if multimodal_input.audio_bytes:
             logger.warning("OpenAI Provider 暂不支持直接音频输入，音频将被忽略")
 
         return content
 
-    def _execute_tool_call(self, tool_call: Any) -> str:
+    def _execute_tool_call(self, name: str, arguments: dict) -> str:
         """执行工具调用并返回结果"""
-        func_name = tool_call.function.name
-        func_args = json.loads(tool_call.function.arguments)
-
-        if func_name not in self._tools_map:
-            return f"Error: Unknown function {func_name}"
+        if name not in self._tools_map:
+            return f"Error: Unknown function {name}"
 
         try:
-            func = self._tools_map[func_name]
-            result = func(**func_args)
+            func = self._tools_map[name]
+            result = func(**arguments)
             return str(result)
         except Exception as e:
-            logger.error(f"工具执行失败 {func_name}: {e}")
-            return f"Error executing {func_name}: {str(e)}"
+            logger.error(f"工具执行失败 {name}: {e}")
+            return f"Error executing {name}: {str(e)}"
 
     def chat(
         self,
@@ -231,7 +220,12 @@ class OpenAIProvider(LLMProvider):
         use_smart_model: bool = False,
         max_tool_calls: int = 10
     ) -> ChatResponse:
-        """发送消息并获取响应"""
+        """
+        使用 Responses API 发送消息并获取响应
+        - smart 模式：启用 reasoning（如果配置了 reasoning_effort）
+        - fast 模式：不启用 reasoning
+        - 两种模式都支持 tools
+        """
         try:
             model_name = self.get_model_name(use_smart_model)
 
@@ -241,82 +235,115 @@ class OpenAIProvider(LLMProvider):
             # 添加当前用户输入
             if multimodal_input:
                 if multimodal_input.image_bytes:
-                    # 多模态消息
                     content = self._build_multimodal_content(multimodal_input)
                     openai_messages.append({
                         "role": "user",
                         "content": content
                     })
                 else:
-                    # 纯文本消息
                     openai_messages.append({
                         "role": "user",
                         "content": multimodal_input.text
                     })
 
-            # 转换工具格式
-            openai_tools = None
-            if tools:
-                self._tools_map = {func.__name__: func for func in tools}
-                openai_tools = [_convert_function_to_openai_tool(func) for func in tools]
-
-            # 准备请求参数
-            request_kwargs = {
+            # 构建请求参数
+            req_kwargs = {
                 "model": model_name,
-                "messages": openai_messages,
-                "temperature": 0.7,
+                "input": openai_messages,
             }
 
-            if openai_tools:
-                request_kwargs["tools"] = openai_tools
-                request_kwargs["tool_choice"] = "auto"
+            # 仅在 smart 模式下启用 reasoning
+            if use_smart_model and self.reasoning_effort:
+                req_kwargs["reasoning"] = {"effort": self.reasoning_effort}
 
-            # 发送请求，处理工具调用循环
+            # 添加工具定义
+            if tools:
+                self._tools_map = {func.__name__: func for func in tools}
+                req_kwargs["tools"] = [_convert_function_to_openai_tool(func) for func in tools]
+
             tool_call_count = 0
+            conversation_input = openai_messages.copy()
+            response = None
+            final_text = ""
 
             while tool_call_count < max_tool_calls:
-                response = self.client.chat.completions.create(**request_kwargs)
+                req_kwargs["input"] = conversation_input
+                response = self.client.responses.create(**req_kwargs)
 
-                assistant_message = response.choices[0].message
-
-                # 检查是否有工具调用
-                if assistant_message.tool_calls:
-                    # 添加助手消息到历史
-                    openai_messages.append({
-                        "role": "assistant",
-                        "content": assistant_message.content or "",
-                        "tool_calls": [
-                            {
-                                "id": tc.id,
-                                "type": "function",
-                                "function": {
-                                    "name": tc.function.name,
-                                    "arguments": tc.function.arguments
-                                }
-                            }
-                            for tc in assistant_message.tool_calls
-                        ]
-                    })
-
-                    # 执行每个工具调用
-                    for tool_call in assistant_message.tool_calls:
-                        result = self._execute_tool_call(tool_call)
-                        openai_messages.append({
-                            "role": "tool",
-                            "tool_call_id": tool_call.id,
-                            "content": result
-                        })
-                        tool_call_count += 1
-                        logger.debug(f"工具调用 [{tool_call_count}]: {tool_call.function.name}")
-
-                    # 更新请求参数的消息
-                    request_kwargs["messages"] = openai_messages
-                else:
-                    # 没有工具调用，返回结果
+                # 检查 output
+                output = getattr(response, "output", [])
+                if not output:
+                    final_text = getattr(response, "output_text", "") or ""
                     break
 
-            # 提取最终响应文本
-            response_text = assistant_message.content or ""
+                # 收集所有 tool_call 和最终文本
+                tool_calls_found = []
+                final_text = ""
+
+                for item in output:
+                    item_type = item.get("type") if isinstance(item, dict) else getattr(item, "type", None)
+
+                    if item_type == "function_call":
+                        if isinstance(item, dict):
+                            call_id = item.get("call_id", item.get("id", ""))
+                            name = item.get("name", "")
+                            arguments = item.get("arguments", {})
+                        else:
+                            call_id = getattr(item, "call_id", getattr(item, "id", ""))
+                            name = getattr(item, "name", "")
+                            arguments = getattr(item, "arguments", {})
+
+                        if isinstance(arguments, str):
+                            try:
+                                arguments = json.loads(arguments)
+                            except json.JSONDecodeError:
+                                arguments = {}
+
+                        tool_calls_found.append({
+                            "call_id": call_id,
+                            "name": name,
+                            "arguments": arguments
+                        })
+
+                    elif item_type == "message":
+                        if isinstance(item, dict):
+                            content = item.get("content", [])
+                        else:
+                            content = getattr(item, "content", [])
+
+                        for c in (content if isinstance(content, list) else [content]):
+                            if isinstance(c, dict) and c.get("type") == "output_text":
+                                final_text += c.get("text", "")
+                            elif isinstance(c, str):
+                                final_text += c
+
+                # 如果没有工具调用，跳出循环
+                if not tool_calls_found:
+                    final_text = getattr(response, "output_text", "") or final_text
+                    break
+
+                # 执行工具调用并添加结果到对话
+                for tc in tool_calls_found:
+                    conversation_input.append({
+                        "type": "function_call",
+                        "call_id": tc["call_id"],
+                        "name": tc["name"],
+                        "arguments": json.dumps(tc["arguments"], ensure_ascii=False) if isinstance(tc["arguments"], dict) else tc["arguments"]
+                    })
+
+                    result = self._execute_tool_call(tc["name"], tc["arguments"])
+
+                    conversation_input.append({
+                        "type": "function_call_output",
+                        "call_id": tc["call_id"],
+                        "output": result
+                    })
+
+                    tool_call_count += 1
+                    logger.debug(f"工具调用 [{tool_call_count}]: {tc['name']}")
+
+            # 提取最终响应
+            response_text = final_text or getattr(response, "output_text", "") or ""
 
             if not response_text.strip():
                 response_text = "抱歉，我暂时无法回应。"

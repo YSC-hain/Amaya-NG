@@ -25,7 +25,8 @@ GEMINI_FAST_MODEL = os.getenv("GEMINI_FAST_MODEL", "gemini-2.5-flash")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_API_BASE = os.getenv("OPENAI_API_BASE", "")  # 第三方 Base URL
 OPENAI_SMART_MODEL = os.getenv("OPENAI_SMART_MODEL", "gpt-5.2")
-OPENAI_FAST_MODEL = os.getenv("OPENAI_FAST_MODEL", "gpt-5.1  ")
+OPENAI_FAST_MODEL = os.getenv("OPENAI_FAST_MODEL", "gpt-5.1")
+OPENAI_REASONING_EFFORT = os.getenv("OPENAI_REASONING_EFFORT", "").lower()  # low/medium/high
 
 
 # --- 验证配置 ---

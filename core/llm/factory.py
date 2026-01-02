@@ -17,7 +17,9 @@ def create_llm_provider(
     api_key: str,
     smart_model: str,
     fast_model: str,
-    api_base: Optional[str] = None
+    api_base: Optional[str] = None,
+    use_responses_api: bool = False,
+    reasoning_effort: Optional[str] = None
 ) -> LLMProvider:
     """
     工厂函数：根据配置创建 LLM 提供者
@@ -52,7 +54,9 @@ def create_llm_provider(
             api_key=api_key,
             smart_model=smart_model,
             fast_model=fast_model,
-            api_base=api_base
+            api_base=api_base,
+            use_responses_api=use_responses_api,
+            reasoning_effort=reasoning_effort
         )
 
     else:
