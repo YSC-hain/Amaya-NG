@@ -117,7 +117,6 @@ class OpenAIProvider(LLMProvider):
         smart_model: str = "gpt-4o",
         fast_model: str = "gpt-4o-mini",
         api_base: Optional[str] = None,
-        use_responses_api: bool = True,  # 默认启用
         reasoning_effort: Optional[str] = None
     ):
         super().__init__(smart_model, fast_model)

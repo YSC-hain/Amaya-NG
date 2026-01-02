@@ -18,7 +18,6 @@ def create_llm_provider(
     smart_model: str,
     fast_model: str,
     api_base: Optional[str] = None,
-    use_responses_api: bool = False,
     reasoning_effort: Optional[str] = None
 ) -> LLMProvider:
     """
@@ -55,7 +54,6 @@ def create_llm_provider(
             smart_model=smart_model,
             fast_model=fast_model,
             api_base=api_base,
-            use_responses_api=use_responses_api,
             reasoning_effort=reasoning_effort
         )
 
