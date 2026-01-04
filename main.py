@@ -12,19 +12,13 @@ import config
 from core.agent import amaya
 from core.reminder_scheduler import ReminderScheduler
 from adapters.telegram_bot import build_application, register_handlers, TelegramSender
+from utils.logging_setup import setup_logging, set_library_log_levels
 
 # --- 设置日志 ---
-logging.basicConfig(
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
-)
-
-logging.getLogger("apscheduler").setLevel(logging.WARNING)
-logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("google.genai").setLevel(logging.WARNING)
-logging.getLogger("telegram.ext._application").setLevel(logging.WARNING)
-
+log_path = setup_logging()
+set_library_log_levels()
 logger = logging.getLogger("Amaya")
+logger.info(f"日志初始化完成，输出路径: {log_path}")
 
 
 # --- 维护任务 ---

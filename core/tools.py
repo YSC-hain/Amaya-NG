@@ -1,5 +1,4 @@
 # core/tools.py
-import json
 import time
 import logging
 import datetime
@@ -13,13 +12,11 @@ from utils.storage import (
     write_file_content,
     delete_file,
     toggle_pin_status,
-    build_reminder_id
+    build_reminder_id,
+    append_event_to_bus
 )
 
 logger = logging.getLogger("Amaya.Tools")
-
-
-# --- 1. 感知类工具 ---
 
 def list_memories() -> str:
     """
@@ -99,9 +96,6 @@ def pin_memory(filename: str, is_pinned: bool = True) -> str:
         return f"Pin/Unpin {filename} failed: {str(e)}"
 
 
-SYS_EVENT_FILE = "data/sys_event_bus.jsonl"  # 保持不变
-
-
 def _parse_target_time(target_time: str, tz: pytz.BaseTzInfo) -> Optional[float]:
     try:
         dt = datetime.datetime.fromisoformat(target_time)
@@ -151,15 +145,11 @@ def schedule_reminder(delay_seconds: Optional[int] = None, prompt: str = "", tar
         "prompt": prompt
     }
 
-    try:
-        with open(SYS_EVENT_FILE, 'a', encoding='utf-8') as f:
-            f.write(json.dumps(event, ensure_ascii=False) + "\n")
+    if append_event_to_bus(event):
         human_time = datetime.datetime.fromtimestamp(run_at, tz=tz).strftime("%m-%d %H:%M:%S")
         logger.debug(f"已创建提醒 {reminder_id}: {prompt} @ {human_time}")
         return f"指令已下达（ID: {reminder_id}）：计划 {delay_seconds} 秒后 / {human_time} 执行 '{prompt}'。"
-    except IOError as e:
-        logger.error(f"写入事件总线失败: {e}")
-        return f"设置失败: {str(e)}"
+    return "设置失败: 写入事件总线异常。"
 
 
 def clear_reminder(reminder_id: str) -> str:
@@ -177,17 +167,10 @@ def clear_reminder(reminder_id: str) -> str:
         "reminder_id": reminder_id
     }
 
-    try:
-        with open(SYS_EVENT_FILE, 'a', encoding='utf-8') as f:
-            f.write(json.dumps(event, ensure_ascii=False) + "\n")
+    if append_event_to_bus(event):
         logger.debug(f"已请求清除提醒: {reminder_id}")
         return f"指令已下达：清除定时提醒, ID: {reminder_id}"
-    except IOError as e:
-        logger.error(f"写入事件总线失败: {e}")
-        return f"设置失败: {str(e)}"
-    except Exception as e:
-        logger.error(f"清除提醒时发生未知错误: {e}")
-        return f"清除失败: {str(e)}"
+    return "设置失败: 写入事件总线异常。"
 
 
 # --- 3. 信息获取类工具 ---
@@ -195,24 +178,29 @@ def clear_reminder(reminder_id: str) -> str:
 def get_weather(city: str) -> str:
     """
     获取指定城市的天气。
+
     Args:
         city: 城市名称，如 "Beijing", "Shanghai", "Shenzhen"。
     """
+    city = (city or "").strip()
+    if not city:
+        return "请提供城市名称，例如 Shanghai。"
     try:
-        # 使用 wttr.in，format=3 适合单行显示，lang=zh 显示中文
-        url = f"https://wttr.in/{city}?format=3&lang=zh"
-        response = requests.get(url, timeout=10)
+        url = f"https://wttr.in/{requests.utils.quote(city)}?format=3&lang=zh"
+        response = requests.get(url, timeout=8, headers={"User-Agent": "Amaya/1.0"})
         if response.status_code == 200:
             return f"{city} 天气: {response.text.strip()}"
-        else:
-            return f"无法获取 {city} 的天气信息 (Status: {response.status_code})"
+        return f"无法获取 {city} 的天气信息，HTTP {response.status_code}。"
+    except requests.RequestException as e:
+        return f"获取天气失败（网络问题）: {str(e)}"
     except Exception as e:
         return f"获取天气失败: {str(e)}"
 
-# ToDo: 优化
+
 def get_china_holiday(date_str: Optional[str] = None) -> str:
     """
     查询中国节假日信息。
+
     Args:
         date_str: 日期字符串 "YYYY-MM-DD"。如果不传则默认查询今天。
     """
@@ -220,17 +208,15 @@ def get_china_holiday(date_str: Optional[str] = None) -> str:
         date_str = datetime.datetime.now().strftime("%Y-%m-%d")
 
     try:
-        # 使用 timor.tech 的免费 API
         url = f"https://timor.tech/api/holiday/info/{date_str}"
-        headers = {"User-Agent": "Mozilla/5.0"}
-        response = requests.get(url, headers=headers, timeout=10)
+        headers = {"User-Agent": "Amaya/1.0"}
+        response = requests.get(url, headers=headers, timeout=8)
         data = response.json()
 
         if data.get("code") != 0:
             return f"查询失败: {data.get('message')}"
 
         info = data.get("type", {})
-        # type enum: 0 工作日, 1 周末, 2 节日, 3 调休
         type_map = {0: "工作日", 1: "周末", 2: "法定节假日", 3: "调休(需要上班)"}
 
         type_val = info.get("type")
@@ -242,6 +228,8 @@ def get_china_holiday(date_str: Optional[str] = None) -> str:
             result += f" ({name})"
 
         return result
+    except requests.RequestException as e:
+        return f"获取节假日信息失败（网络问题）: {str(e)}"
     except Exception as e:
         return f"获取节假日信息失败: {str(e)}"
 

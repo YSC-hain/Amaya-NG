@@ -6,6 +6,7 @@ import threading
 from datetime import datetime
 import time
 from typing import Any, Optional, List
+import config
 
 logger = logging.getLogger("Amaya.Storage")
 
@@ -238,4 +239,66 @@ def get_global_context_string():
     reminders_summary = get_pending_reminders_summary()
     context_parts.append(f"\n=== ACTIVE TIMERS (PENDING) ===\n{reminders_summary}")
 
-    return "\n".join(context_parts)
+    full_context = "\n".join(context_parts)
+    if len(full_context) > config.GLOBAL_CONTEXT_MAX_CHARS:
+        truncated = full_context[:config.GLOBAL_CONTEXT_MAX_CHARS]
+        notice = f"[Context trimmed to {config.GLOBAL_CONTEXT_MAX_CHARS} chars]\n"
+        return notice + truncated
+    return full_context
+
+
+# --- 事件总线读写（线程安全）---
+def append_event_to_bus(event: dict) -> bool:
+    """
+    线程安全地向系统事件总线追加一条事件。
+    """
+    path = FILES["sys_bus"]
+    lock = _get_file_lock(path)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    try:
+        with lock, open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(event, ensure_ascii=False) + "\n")
+        return True
+    except IOError as e:
+        logger.error(f"写入事件总线失败: {e}")
+        return False
+
+
+def read_events_from_bus() -> tuple[list[dict], list[str]]:
+    """
+    线程安全地读取并清空系统事件总线。
+    返回 (events, invalid_lines)。
+    """
+    path = FILES["sys_bus"]
+    lock = _get_file_lock(path)
+    if not os.path.exists(path):
+        return [], []
+
+    try:
+        with lock, open(path, "r+", encoding="utf-8") as f:
+            lines = f.readlines()
+            f.seek(0)
+            f.truncate()
+    except IOError as e:
+        logger.error(f"读取事件总线失败: {e}")
+        return [], []
+
+    events: list[dict] = []
+    invalid_lines: list[str] = []
+    for line in lines:
+        if not line.strip():
+            continue
+        try:
+            events.append(json.loads(line))
+        except json.JSONDecodeError as e:
+            logger.warning(f"事件解析失败，保留原数据: {e}")
+            invalid_lines.append(line)
+
+    if invalid_lines:
+        try:
+            with lock, open(path, "a", encoding="utf-8") as f:
+                f.writelines(invalid_lines)
+        except IOError as e:
+            logger.error(f"回写无效事件失败: {e}")
+
+    return events, invalid_lines

@@ -12,6 +12,7 @@ import config
 from core.llm import create_llm_provider, ChatMessage, MultimodalInput
 from core.tools import tools_registry
 from utils.storage import get_global_context_string, load_json, save_json
+from openai import OpenAI
 
 logger = logging.getLogger("Amaya.Agent")
 
@@ -87,6 +88,70 @@ class AmayaBrain:
         self._save_short_term_memory()
         logger.info("Amaya 状态已保存")
 
+    def _transcribe_audio_openai(self, audio_bytes: bytes, audio_mime: str) -> str | None:
+        """
+        使用 OpenAI Whisper 将音频转为文本。
+        转写失败返回 None，不抛异常到上层。
+        """
+        try:
+            client_kwargs = {"api_key": config.OPENAI_API_KEY}
+            if config.OPENAI_API_BASE:
+                client_kwargs["base_url"] = config.OPENAI_API_BASE
+            client = OpenAI(**client_kwargs)
+            # whisper-1 需要文件名，随机构造
+            file_tuple = ("speech." + (audio_mime.split("/")[-1] or "ogg"), audio_bytes, audio_mime)
+            resp = client.audio.transcriptions.create(
+                model=config.OPENAI_TRANSCRIBE_MODEL,
+                file=file_tuple,
+            )
+            text = getattr(resp, "text", "") or ""
+            return text.strip() or None
+        except Exception as e:
+            logger.warning(f"音频转写失败: {e}")
+            return None
+
+    def _log_tool_calls(self, response) -> None:
+        """记录工具调用明细（仅包含名称与参数，不打印模型生成的原始内容）。"""
+        try:
+            raw = getattr(response, "raw_response", None)
+            calls: list[tuple[str, dict]] = []
+
+            # OpenAI Responses API: output 是一个列表，每个 item 可能包含 content
+            if raw and hasattr(raw, "output"):
+                for item in getattr(raw, "output", []):
+                    content = item.get("content") if isinstance(item, dict) else getattr(item, "content", None)
+                    if not content:
+                        continue
+                    for block in content:
+                        if isinstance(block, dict) and block.get("type") == "tool_call":
+                            name = block.get("name") or "unknown"
+                            args = block.get("arguments") or {}
+                            calls.append((name, args))
+
+            if calls:
+                logger.info("工具调用: %s", calls)
+        except Exception as e:
+            logger.debug(f"记录工具调用失败: {e}")
+
+    def _log_tool_calls(self, response) -> None:
+        """记录工具调用明细（仅包含名称与参数，不打印模型生成的原始内容）。"""
+        try:
+            tool_calls = getattr(response, "raw_response", None)
+            # OpenAI Responses API 会在 raw_response.output[0].content 中包含 tool_calls
+            calls = []
+            if tool_calls and hasattr(tool_calls, "output"):
+                for item in getattr(tool_calls, "output", []):
+                    if isinstance(item, dict) and item.get("content"):
+                        for block in item["content"]:
+                            if block.get("type") == "tool_call":
+                                name = block.get("name")
+                                args = block.get("arguments")
+                                calls.append((name, args))
+            if calls:
+                logger.info("工具调用: %s", calls)
+        except Exception as e:
+            logger.debug(f"记录工具调用失败: {e}")
+
     def _get_cleaned_history(self) -> list[ChatMessage]:
         """剔除过期的历史记录，返回 ChatMessage 列表"""
         cutoff = time.time() - config.SHORT_TERM_MEMORY_TTL
@@ -96,6 +161,10 @@ class AmayaBrain:
         messages = []
         for m in self.short_term_memory:
             messages.append(ChatMessage.from_dict(m))
+        # 限制总条数，保留最新的记录
+        if len(messages) > config.SHORT_TERM_MEMORY_MAX_ENTRIES:
+            messages = messages[-config.SHORT_TERM_MEMORY_MAX_ENTRIES:]
+            self.short_term_memory = [m.to_dict() for m in messages]
         return messages
 
     def get_world_background(self):
@@ -114,6 +183,8 @@ class AmayaBrain:
         # 如果涉及规划、反思、大量文件操作，切换到 Smart 模型
         logic_keywords = ["规划", "计划", "安排", "整理", "复盘", "反思", "分析", "schedule", "plan"]
         use_smart = (image_bytes or audio_bytes) or any(k in user_text for k in logic_keywords)
+        start_time = time.time()
+        selected_model = self.llm.get_model_name(use_smart)
 
         try:
             # 1. 获取上下文
@@ -122,12 +193,22 @@ class AmayaBrain:
             # 获取并清理短期对话历史
             history = self._get_cleaned_history()
 
+            # OpenAI provider: 先尝试语音转文字（whisper），转写失败则提示
+            if audio_bytes and self.llm.provider_name == "openai":
+                transcript = self._transcribe_audio_openai(audio_bytes, audio_mime)
+                if transcript:
+                    user_text = f"[语音转写] {transcript}"
+                    audio_bytes = b""  # 避免继续传递无效音频
+                else:
+                    logger.warning("当前提供者不支持直接处理语音且转写失败，已提示用户。")
+                    return "当前模型暂不支持直接处理语音，且自动转写失败，请发送文字或先将语音转成文字后再发送。"
+
             # 2. 构造 Prompt，把记忆强行塞进上下文
             full_input = f"""
 [WORLD CONTEXT]
 {global_context}
 
-[WORLD BACKGROUD]
+[WORLD BACKGROUND]
 {self.get_world_background()}
 
 [USER INPUT]
@@ -143,6 +224,15 @@ class AmayaBrain:
             )
 
             # 4. 调用 LLM
+            logger.info(
+                "LLM 调用开始 provider=%s model=%s use_smart=%s has_image=%s has_audio=%s text_len=%s",
+                self.llm.provider_name,
+                selected_model,
+                use_smart,
+                bool(image_bytes),
+                bool(audio_bytes),
+                len(user_text),
+            )
             response = self.llm.chat(
                 messages=history,
                 system_instruction=self.system_instruction,
@@ -153,6 +243,8 @@ class AmayaBrain:
             )
 
             response_text = response.text
+            # 记录工具调用摘要（不包含模型原始输出）
+            self._log_tool_calls(response)
 
             # 确保不返回空字符串
             if not response_text.strip():
@@ -165,6 +257,16 @@ class AmayaBrain:
 
             # 保存短期记忆
             self._save_short_term_memory()
+
+            elapsed = time.time() - start_time
+            logger.info(
+                "LLM 调用完成 provider=%s model=%s use_smart=%s elapsed_sec=%.3f response_len=%s",
+                self.llm.provider_name,
+                selected_model,
+                use_smart,
+                elapsed,
+                len(response_text),
+            )
 
             return response_text
 
@@ -199,11 +301,13 @@ Context:
             # 使用独立的 chat session（无历史记录）避免上下文污染
             multimodal_input = MultimodalInput(text=maintenance_prompt)
 
+            # Dry-run 模式下不允许工具调用，避免自修改风险
+            tools = [] if config.TIDYING_DRY_RUN else tools_registry
             response = self.llm.chat(
                 messages=[],  # 无历史记录
                 system_instruction=self.system_instruction + self.maintenance_instruction,
                 multimodal_input=multimodal_input,
-                tools=tools_registry,
+                tools=tools,
                 use_smart_model=True,
                 max_tool_calls=10
             )
@@ -211,6 +315,8 @@ Context:
             response_text = response.text
             if not response_text:
                 response_text = "System clean."
+            if config.TIDYING_DRY_RUN:
+                response_text = f"[Dry-run，无文件修改] {response_text}"
 
             return f"整理报告: {response_text}"
 
