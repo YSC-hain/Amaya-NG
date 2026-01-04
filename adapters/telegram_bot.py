@@ -27,6 +27,8 @@ logger = logging.getLogger("Amaya.Telegram")
 # Telegram 消息长度限制
 MAX_MESSAGE_LENGTH = 4096
 ALLOWED_AUDIO_MIME = {"audio/ogg", "audio/webm", "audio/wav", "audio/flac", "audio/mp3", "audio/mpeg"}
+# 多消息缓冲窗口（秒，可在 config 中调节）
+RAPID_MESSAGE_BUFFER_SECONDS = config.RAPID_MESSAGE_BUFFER_SECONDS
 
 
 # --- 工具函数 ---
@@ -112,6 +114,114 @@ async def _typing_spinner(context: ContextTypes.DEFAULT_TYPE, chat_id: int, stop
         pass
     except Exception as e:
         logger.debug(f"typing spinner 异常: {e}")
+
+
+def _format_batch_response(pairs: List[Tuple[str, str]]) -> str:
+    """
+    将多条用户输入与模型回复合并为单条输出。
+
+    示例：
+        输入: [("Hi", "你好"), ("再见", "好的，再见")]
+        输出:
+        收到连续多条消息，合并回复如下：
+        1. 用户输入：Hi
+        回复：你好
+
+        2. 用户输入：再见
+        回复：好的，再见
+    """
+    if not pairs:
+        return "抱歉，没有可用的回复。"
+    if len(pairs) == 1:
+        return pairs[0][1]
+
+    blocks = ["收到连续多条消息，合并回复如下："]
+    for idx, (user_text, resp) in enumerate(pairs, 1):
+        sanitized = user_text.strip() if user_text else "(空消息)"
+        blocks.append(f"{idx}. 用户输入：{sanitized}\n回复：{resp}")
+    return "\n\n".join(blocks)
+
+
+class ChatSessionBuffer:
+    """
+    为同一 chat_id 缓冲短时间内的多条消息，串行处理后合并回复。
+    结构保持简单：仅用一个队列 + 一个后台 task，无额外线程或锁。
+    """
+
+    def __init__(self, chat_id: int, buffer_seconds: float = RAPID_MESSAGE_BUFFER_SECONDS):
+        self.chat_id = chat_id
+        self.buffer_seconds = buffer_seconds
+        self.queue: List[Tuple[str, object]] = []
+        self.processing = False
+        self.new_message_event = asyncio.Event()
+
+    def enqueue(self, user_text: str, message_obj) -> None:
+        self.queue.append((user_text, message_obj))
+        self.new_message_event.set()
+
+    async def process(self, context: ContextTypes.DEFAULT_TYPE):
+        """
+        处理累积的消息：
+        1) 初始等待 buffer_seconds 收集短间隔连发的文本；
+        2) 将当前队列串行调用 Agent 并合并回复；
+        3) 若在处理期间有新消息到达，再次循环，直到队列空且无新输入。
+        """
+        if self.processing:
+            return
+        self.processing = True
+
+        stop_event = asyncio.Event()
+        spinner = asyncio.create_task(_typing_spinner(context, self.chat_id, stop_event))
+
+        try:
+            # 初始小缓冲，收集同一瞬间的消息
+            await asyncio.sleep(self.buffer_seconds)
+
+            while True:
+                if not self.queue:
+                    try:
+                        await asyncio.wait_for(self.new_message_event.wait(), timeout=self.buffer_seconds)
+                        self.new_message_event.clear()
+                    except asyncio.TimeoutError:
+                        break
+
+                # 拷贝队列并清空，避免重复处理
+                batch = list(self.queue)
+                self.queue.clear()
+                self.new_message_event.clear()
+
+                responses: List[Tuple[str, str]] = []
+                for user_text, message_obj in batch:
+                    try:
+                        resp = await asyncio.to_thread(amaya.chat_sync, user_text)
+                    except Exception as e:
+                        logger.error(f"聊天处理异常: {e}")
+                        resp = "抱歉，处理消息时发生错误，请稍后重试。"
+                    responses.append((user_text, resp))
+
+                combined = _format_batch_response(responses)
+                target_message = batch[-1][1]
+                await _send_with_fallback(target_message, combined)
+
+                # 短暂停顿，观察是否有新的消息进入队列
+                try:
+                    await asyncio.wait_for(self.new_message_event.wait(), timeout=self.buffer_seconds)
+                    self.new_message_event.clear()
+                    continue
+                except asyncio.TimeoutError:
+                    if not self.queue:
+                        break
+        finally:
+            stop_event.set()
+            try:
+                await asyncio.wait_for(spinner, timeout=1.0)
+            except asyncio.TimeoutError:
+                spinner.cancel()
+            self.processing = False
+
+
+# 维护各 chat 的缓冲实例
+CHAT_BUFFERS: dict[int, ChatSessionBuffer] = {}
 
 
 # --- Telegram MessageSender 实现 ---
@@ -230,31 +340,12 @@ async def chat_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("未授权。仅限 OWNER 使用。")
         return
 
-    stop_event = asyncio.Event()
-    spinner = asyncio.create_task(_typing_spinner(context, chat_id, stop_event))
+    session = CHAT_BUFFERS.setdefault(chat_id, ChatSessionBuffer(chat_id))
+    session.enqueue(user_text, update.message)
 
-    # 让出控制权，确保 spinner 立即开始执行
-    await asyncio.sleep(0)
-
-    response_text = None
-    try:
-        # 使用 to_thread 在线程池中运行阻塞的 Gemini 调用
-        # 这样 typing spinner 可以继续在主事件循环中运行
-        response_text = await asyncio.to_thread(amaya.chat_sync, user_text)
-    except Exception as e:
-        logger.error(f"聊天处理异常: {e}")
-        response_text = "抱歉，处理消息时发生错误，请稍后重试。"
-    finally:
-        stop_event.set()
-        # 给 spinner 一点时间优雅退出
-        try:
-            await asyncio.wait_for(spinner, timeout=1.0)
-        except asyncio.TimeoutError:
-            spinner.cancel()
-
-    if response_text:
-        logger.info(f"Amaya 回复: {response_text[:50]}...")
-        await _send_with_fallback(update.message, response_text)
+    # 独立任务处理队列，允许新的消息快速返回（合并后统一回复）
+    if not session.processing:
+        asyncio.create_task(session.process(context))
 
 
 async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):

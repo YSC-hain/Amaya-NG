@@ -27,6 +27,7 @@ OPENAI_API_BASE = os.getenv("OPENAI_API_BASE", "")  # 第三方 Base URL
 OPENAI_SMART_MODEL = os.getenv("OPENAI_SMART_MODEL", "gpt-5.2")
 OPENAI_FAST_MODEL = os.getenv("OPENAI_FAST_MODEL", "gpt-5.1")
 OPENAI_REASONING_EFFORT = os.getenv("OPENAI_REASONING_EFFORT", "").lower()  # low/medium/high
+OPENAI_TRANSCRIBE_MODEL = os.getenv("OPENAI_TRANSCRIBE_MODEL", "whisper-1")
 
 
 # --- 验证配置 ---
@@ -49,7 +50,18 @@ elif LLM_PROVIDER not in ("gemini", "openai"):
 EVENT_BUS_CHECK_INTERVAL = 5  # 事件总线检查间隔（秒）
 MAINTENANCE_INTERVAL_HOURS = 8  # 自动整理间隔（小时）
 SHORT_TERM_MEMORY_TTL = 10800  # 短期记忆过期时间（秒）
+# 短期记忆条数与上下文长度可通过环境变量调节，避免在生产与开发环境写死
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, default))
+    except (TypeError, ValueError):
+        return default
+
+SHORT_TERM_MEMORY_MAX_ENTRIES = _env_int("SHORT_TERM_MEMORY_MAX_ENTRIES", 80)  # 超出后从旧到新截断
+GLOBAL_CONTEXT_MAX_CHARS = _env_int("GLOBAL_CONTEXT_MAX_CHARS", 10000)  # 注入到 prompt 的全局上下文最大字符数，超出将截断
 TIMEZONE = "Asia/Shanghai"  # 时区
+TIDYING_DRY_RUN = os.getenv("TIDYING_DRY_RUN", "false").lower() == "true"
+RAPID_MESSAGE_BUFFER_SECONDS = float(os.getenv("RAPID_MESSAGE_BUFFER_SECONDS", "2.5"))  # 聊天快速连发缓冲窗口
 
 # --- 模型配置（兼容旧代码，实际从上方配置读取）---
 SMART_MODEL = GEMINI_SMART_MODEL if LLM_PROVIDER == "gemini" else OPENAI_SMART_MODEL

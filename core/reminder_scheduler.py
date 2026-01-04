@@ -1,6 +1,4 @@
 # core/reminder_scheduler.py
-import os
-import json
 import logging
 import time
 import datetime
@@ -10,7 +8,7 @@ from apscheduler.triggers.date import DateTrigger
 from typing import TYPE_CHECKING
 
 from core.agent import amaya
-from utils.storage import load_json, save_json, build_reminder_id
+from utils.storage import load_json, save_json, build_reminder_id, read_events_from_bus
 import config
 
 if TYPE_CHECKING:
@@ -25,6 +23,10 @@ class ReminderScheduler:
         self.sender = sender
         # 使用配置中的时区
         self.timezone = pytz.timezone(config.TIMEZONE)
+        # 观测指标
+        self.invalid_event_lines = 0
+        self.ignored_past_events = 0
+        self.missing_field_events = 0
 
     async def restore_reminders(self):
         """启动时恢复未完成的提醒"""
@@ -36,6 +38,7 @@ class ReminderScheduler:
 
         logger.info(f"正在恢复 {len(reminders)} 个未执行的提醒...")
         restored_count = 0
+        cleaned_ids = set()
 
         for reminder in reminders:
             run_at = reminder.get('run_at', 0)
@@ -43,6 +46,7 @@ class ReminderScheduler:
             prompt = reminder.get('prompt')
 
             if not reminder_id:
+                cleaned_ids.add(reminder_id)
                 continue
 
             # 使用 datetime 进行比较更加直观
@@ -62,52 +66,28 @@ class ReminderScheduler:
                 logger.info(f"已恢复提醒: '{prompt}' (at {run_date})")
             else:
                 # 已错过的任务，立即触发
-                # 使用 apscheduler 的 run_date=now 立刻执行，而不是直接 await，保持异步一致性
                 self.scheduler.add_job(
                     self.execute_reminder,
                     trigger=DateTrigger(run_date=datetime.datetime.now(self.timezone) + datetime.timedelta(seconds=1)),
                     args=[f"[延迟的提醒] {prompt}", reminder_id]
                 )
+                cleaned_ids.add(reminder_id)
                 logger.warning(f"发现已错过的提醒，已安排立即补发: '{prompt}'")
 
-        # 清理掉那些无效的数据（可选，这里暂不清理，交给 execute_reminder 逐步清理）
+        if cleaned_ids:
+            reminders = [r for r in reminders if r.get("id") not in cleaned_ids]
+            save_json("pending_reminders", reminders)
+            logger.info(f"已清理 {len(cleaned_ids)} 条无效/过期的提醒记录。")
+        logger.info(f"恢复完成，共安排 {restored_count} 个提醒。")
 
     async def check_system_events(self):
         """每5秒检查sys_event_bus.jsonl，注册新任务"""
-        sys_bus_path = "data/sys_event_bus.jsonl"
-        if not os.path.exists(sys_bus_path):
+        events_to_process, invalid_lines = read_events_from_bus()
+        if not events_to_process and not invalid_lines:
             return
-
-        events_to_process = []
-        lines_to_keep = []  # 解析失败的行，需要保留
-        try:
-            # 读写模式打开，读取后清空
-            with open(sys_bus_path, 'r+', encoding='utf-8') as f:
-                lines = f.readlines()
-                if not lines:
-                    return
-                f.seek(0)
-                f.truncate()
-
-            for line in lines:
-                if line.strip():
-                    try:
-                        events_to_process.append(json.loads(line))
-                    except json.JSONDecodeError as e:
-                        logger.warning(f"事件解析失败，保留原数据: {e}")
-                        lines_to_keep.append(line)
-
-            # 将解析失败的行写回文件
-            if lines_to_keep:
-                with open(sys_bus_path, 'a', encoding='utf-8') as f:
-                    f.writelines(lines_to_keep)
-
-        except IOError as e:
-            logger.error(f"总线文件读写失败: {e}")
-            return
-        except Exception as e:
-            logger.exception(f"总线处理异常: {e}")
-            return
+        if invalid_lines:
+            self.invalid_event_lines += len(invalid_lines)
+            logger.warning(f"事件总线中保留了 {len(invalid_lines)} 条无法解析的行，累计 {self.invalid_event_lines} 条。")
 
         for event in events_to_process:
             if event.get("type") == "reminder":
@@ -115,6 +95,7 @@ class ReminderScheduler:
                 prompt = event.get("prompt")
                 if run_at is None or prompt is None:
                     logger.warning("reminder 事件缺少 run_at 或 prompt，已跳过")
+                    self.missing_field_events += 1
                     continue
                 # 使用事件内的 ID，若缺失则生成一个
                 job_id = event.get("id") or build_reminder_id(run_at)
@@ -133,7 +114,8 @@ class ReminderScheduler:
                     self.update_pending_reminders(job_id, run_at, prompt)
                     logger.info(f"新任务已调度: '{prompt}' (at {run_date})")
                 else:
-                    logger.warning("尝试设置过去的时间，忽略。")
+                    self.ignored_past_events += 1
+                    logger.warning(f"尝试设置过去的时间，已忽略。本次累计忽略 {self.ignored_past_events} 条过期事件。")
 
             elif event.get("type") == "clear_reminder":
                 # 支持删除提醒
