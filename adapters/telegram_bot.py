@@ -339,21 +339,21 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(UNAUTHORIZED_TEXT)
         return
     help_text = (
-        "*Amaya ????*\n\n"
-        "  *????* - ????????\n"
-        "  *????* - ?????????\n"
-        "  *????* - ???????????\n\n"
-        "*????:*\n"
-        "/start - ?? Bot ??\n"
-        "/ping - ??????\n"
-        "/reminders - ????????\n"
-        "/whoami - ??????\n"
-        "/user_create - ????(???)\n"
-        "/user_link - ?? telegram_id ? user_id(???)\n"
-        "/help - ?????\n\n"
-        "*????:*\n"
-        "\"10????????\"\n"
-        "\"????8?????\""
+        "*Amaya 帮助*\n\n"
+        "  *聊天* - 直接发送文本\n"
+        "  *提醒* - 自然语言设置提醒\n"
+        "  *记忆* - 记录/查看记忆\n\n"
+        "*命令:*\n"
+        "/start - 启动 Bot\n"
+        "/ping - 健康检查\n"
+        "/reminders - 查看挂起的提醒\n"
+        "/whoami - 查看当前绑定\n"
+        "/user_create - 创建用户(管理员)\n"
+        "/user_link - 绑定 `telegram_id` 与 `user_id`(管理员)\n"
+        "/help - 查看帮助\n\n"
+        "*示例:*\n"
+        "\"10分钟后提醒我喝水\"\n"
+        "\"明天早上8点叫醒我\""
     )  # ToDo
     await _send_with_fallback(update.message, help_text)
 
@@ -369,7 +369,7 @@ async def whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
         safe_user_id = _escape_markdown(str(user_id))
         text = f"chat_id: `{safe_chat_id}`\nuser_id: `{safe_user_id}`"
     else:
-        text = f"chat_id: `{safe_chat_id}`\n???? user_id?"
+        text = f"chat_id: `{safe_chat_id}`\n未绑定 `user_id`，请联系管理员。"
     await _send_with_fallback(update.message, text)
 
 
@@ -380,8 +380,11 @@ async def user_create(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     display_name = " ".join(context.args).strip() or None
     user_id = create_user(display_name)
+    if not user_id:
+        await update.message.reply_text("创建用户失败，请查看日志。")
+        return
     safe_user_id = _escape_markdown(str(user_id))
-    message = f"??????\nuser_id: `{safe_user_id}`"
+    message = f"用户创建成功。\nuser_id: `{safe_user_id}`"
     if display_name:
         message += f"\nname: {_escape_markdown(display_name)}"
     await _send_with_fallback(update.message, message)
@@ -401,7 +404,7 @@ async def user_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if len(args) < 2:
         await update.message.reply_text(
-            "??: /user_link <telegram_id> <user_id> [display_name] [--force]"
+            "用法: /user_link <telegram_id> <user_id> [display_name] [--force]"
         )
         return
 
@@ -416,10 +419,10 @@ async def user_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     if ok:
         await update.message.reply_text(
-            f"???: telegram_id={telegram_id} -> user_id={user_id}",
+            f"绑定成功: telegram_id={telegram_id} -> user_id={user_id}",
         )
     else:
-        await update.message.reply_text("??????????????????? --force ???")
+        await update.message.reply_text("该 telegram_id 已绑定其他用户，如需覆盖请加 --force。")
 
 
 async def reminders(update: Update, context: ContextTypes.DEFAULT_TYPE):

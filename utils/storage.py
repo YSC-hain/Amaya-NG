@@ -5,8 +5,7 @@ import logging
 import sqlite3
 import threading
 import re
-import uuid
-from datetime import datetime
+from datetime import datetime, timedelta, date
 import time
 from typing import Any, Optional, List
 import config
@@ -24,30 +23,10 @@ def build_reminder_id(run_at: float) -> str:
     return f"r{ts_part}{rand_part}"
 
 
-# 全局文件锁，防止并发读写
-_file_locks: dict[str, threading.Lock] = {}
-_locks_lock = threading.Lock()  # 保护 _file_locks 的锁
-
-def _get_file_lock(path: str) -> threading.Lock:
-    """获取指定文件的锁"""
-    with _locks_lock:
-        if path not in _file_locks:
-            _file_locks[path] = threading.Lock()
-        return _file_locks[path]
-
 # 定义记忆库的物理路径
 DATA_DIR = "data/memory_bank"
 os.makedirs(DATA_DIR, exist_ok=True)
-_legacy_memory_migrated = False
-
-# --- 文件路径注册表 ---
-# 集中管理所有数据文件路径
-FILES = {
-    "meta": os.path.join("data", "meta.json"),
-    "pending_reminders": os.path.join("data", "pending_reminders.json"),
-    "sys_bus": os.path.join("data", "sys_event_bus.jsonl"),
-    "short_term_memory": os.path.join("data", "short_term_memory.json")
-}
+SCHEDULE_FILE = "routine.json"
 
 # --- SQLite 存储 ---
 DB_PATH = config.DB_PATH
@@ -61,20 +40,6 @@ def _get_db_connection() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.row_factory = sqlite3.Row
     return conn
-
-
-def _load_json_file(path: str, default: Optional[Any] = None) -> Any:
-    if not os.path.exists(path):
-        return default
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except json.JSONDecodeError as e:
-        logger.error(f"JSON 解析失败 {path}: {e}")
-        return default
-    except IOError as e:
-        logger.warning(f"读取文件失败 {path}: {e}")
-        return default
 
 
 def _init_db() -> None:
@@ -140,125 +105,23 @@ def _init_db() -> None:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_pending_reminders_user ON pending_reminders(user_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_memory_user ON short_term_memory(user_id)")
 
-    _migrate_schema()
-    _migrate_json_to_db()
-
-
-def _get_table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
-    rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
-    return {row[1] for row in rows}
-
-
-def _migrate_schema() -> None:
-    with _db_lock, _get_db_connection() as conn:
-        # meta table migration (add user_id dimension)
-        cols = _get_table_columns(conn, "meta")
-        if cols and "user_id" not in cols:
-            conn.execute("ALTER TABLE meta RENAME TO meta_legacy")
-            conn.execute("""
-                CREATE TABLE meta (
-                    user_id TEXT NOT NULL,
-                    key TEXT NOT NULL,
-                    value TEXT NOT NULL,
-                    PRIMARY KEY (user_id, key)
-                )
-            """)
-            conn.execute(
-                "INSERT INTO meta (user_id, key, value) SELECT ?, key, value FROM meta_legacy",
-                (config.DEFAULT_USER_ID,)
-            )
-            conn.execute("DROP TABLE meta_legacy")
-
-        for table in ("pending_reminders", "short_term_memory", "sys_events"):
-            cols = _get_table_columns(conn, table)
-            if cols and "user_id" not in cols:
-                conn.execute(f"ALTER TABLE {table} ADD COLUMN user_id TEXT")
-                conn.execute(
-                    f"UPDATE {table} SET user_id = ? WHERE user_id IS NULL",
-                    (config.DEFAULT_USER_ID,)
-                )
-
-
-def _migrate_json_to_db() -> None:
-    """
-    将旧版 JSON 文件迁移到 SQLite（仅在表为空时执行）。
-    保留原文件以便回滚/审计。
-    """
-    with _db_lock, _get_db_connection() as conn:
-        meta_count = conn.execute("SELECT COUNT(*) FROM meta").fetchone()[0]
-        pending_count = conn.execute("SELECT COUNT(*) FROM pending_reminders").fetchone()[0]
-        memory_count = conn.execute("SELECT COUNT(*) FROM short_term_memory").fetchone()[0]
-        event_count = conn.execute("SELECT COUNT(*) FROM sys_events").fetchone()[0]
-
-        if meta_count == 0 and os.path.exists(FILES["meta"]):
-            meta = _load_json_file(FILES["meta"], default={}) or {}
-            pinned_files = meta.get("pinned_files", [])
-            conn.execute(
-                "INSERT OR REPLACE INTO meta (user_id, key, value) VALUES (?, ?, ?)",
-                (config.DEFAULT_USER_ID, "pinned_files", json.dumps(pinned_files, ensure_ascii=False))
-            )
-            logger.info("已迁移 meta.json -> SQLite")
-
-        if pending_count == 0 and os.path.exists(FILES["pending_reminders"]):
-            reminders = _load_json_file(FILES["pending_reminders"], default=[]) or []
-            rows = [
-                (r.get("id"), config.DEFAULT_USER_ID, r.get("run_at", 0), r.get("prompt", ""))
-                for r in reminders if r.get("id")
-            ]
-            if rows:
-                conn.executemany(
-                    "INSERT OR REPLACE INTO pending_reminders (id, user_id, run_at, prompt) VALUES (?, ?, ?, ?)",
-                    rows
-                )
-            logger.info("已迁移 pending_reminders.json -> SQLite")
-
-        if memory_count == 0 and os.path.exists(FILES["short_term_memory"]):
-            memory = _load_json_file(FILES["short_term_memory"], default=[]) or []
-            rows = [
-                (config.DEFAULT_USER_ID, m.get("role", "user"), m.get("text", ""), m.get("timestamp", 0))
-                for m in memory
-            ]
-            if rows:
-                conn.executemany(
-                    "INSERT INTO short_term_memory (user_id, role, text, timestamp) VALUES (?, ?, ?, ?)",
-                    rows
-                )
-            logger.info("已迁移 short_term_memory.json -> SQLite")
-
-        if event_count == 0 and os.path.exists(FILES["sys_bus"]):
-            try:
-                with open(FILES["sys_bus"], "r", encoding="utf-8") as f:
-                    lines = f.readlines()
-            except IOError as e:
-                logger.warning(f"读取 sys_event_bus 失败: {e}")
-                lines = []
-
-            for line in lines:
-                if not line.strip():
-                    continue
-                event_type = None
-                event_id = None
-                status = "pending"
-                event_user_id = config.DEFAULT_USER_ID
-                payload = line.strip()
-                try:
-                    event = json.loads(line)
-                    event_type = event.get("type")
-                    event_id = event.get("id") or event.get("reminder_id")
-                    event_user_id = event.get("user_id") or config.DEFAULT_USER_ID
-                    payload = json.dumps(event, ensure_ascii=False)
-                except json.JSONDecodeError:
-                    status = "invalid"
-                conn.execute(
-                    "INSERT INTO sys_events (user_id, event_id, event_type, payload, status, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-                    (event_user_id, event_id, event_type, payload, status, time.time())
-                )
-            if lines:
-                logger.info("已迁移 sys_event_bus.jsonl -> SQLite")
-
 # --- 用户映射 ---
-def _create_user_id() -> str:
-    return uuid.uuid4().hex
+def _create_user_id(conn: sqlite3.Connection) -> str:
+    row = conn.execute(
+        """
+        SELECT user_id
+        FROM users
+        WHERE user_id GLOB '[0-9]*'
+          AND user_id NOT GLOB '*[^0-9]*'
+          AND length(user_id) <= 6
+        ORDER BY CAST(user_id AS INTEGER) DESC
+        LIMIT 1
+        """
+    ).fetchone()
+    next_id = 1 if not row else int(row["user_id"]) + 1
+    if next_id > 999999:
+        raise ValueError("User id sequence exhausted (max 6 digits)")
+    return f"{next_id:06d}"
 
 
 def lookup_user_id(platform: str, external_id: str) -> Optional[str]:
@@ -278,11 +141,11 @@ def lookup_user_id(platform: str, external_id: str) -> Optional[str]:
     return row["user_id"] if row else None
 
 
-def create_user(display_name: Optional[str] = None, user_id: Optional[str] = None) -> str:
-    resolved_user_id = user_id or _create_user_id()
+def create_user(display_name: Optional[str] = None, user_id: Optional[str] = None) -> Optional[str]:
     now = time.time()
     try:
         with _db_lock, _get_db_connection() as conn:
+            resolved_user_id = user_id or _create_user_id(conn)
             row = conn.execute(
                 "SELECT user_id FROM users WHERE user_id = ?",
                 (resolved_user_id,)
@@ -297,10 +160,10 @@ def create_user(display_name: Optional[str] = None, user_id: Optional[str] = Non
                     "UPDATE users SET display_name = ? WHERE user_id = ?",
                     (display_name, resolved_user_id)
                 )
-    except sqlite3.Error as e:
+            return resolved_user_id
+    except (sqlite3.Error, ValueError) as e:
         logger.error(f"Create user failed: {e}")
-        return config.DEFAULT_USER_ID
-    return resolved_user_id
+        return None
 
 
 def link_user_mapping(
@@ -427,7 +290,7 @@ def resolve_user_id(platform: str, external_id: str, display_name: Optional[str]
                     )
                 return user_id
 
-            user_id = _create_user_id()
+            user_id = _create_user_id(conn)
             now = time.time()
             conn.execute(
                 "INSERT INTO users (user_id, display_name, created_at) VALUES (?, ?, ?)",
@@ -439,7 +302,7 @@ def resolve_user_id(platform: str, external_id: str, display_name: Optional[str]
             )
             logger.info("已创建新用户映射 platform=%s external_id=%s user_id=%s", platform, external_id, user_id)
             return user_id
-        except sqlite3.Error as e:
+        except (sqlite3.Error, ValueError) as e:
             logger.error(f"用户映射失败: {e}")
             return config.DEFAULT_USER_ID
 
@@ -601,125 +464,34 @@ def load_all_pending_reminders() -> list[dict]:
     ]
 
 def load_json(file_key: str, default: Optional[Any] = None, user_id: Optional[str] = None) -> Any:
-    """读取指定的 JSON 文件（线程安全）"""
+    """读取指定的 JSON 数据（线程安全）"""
     if file_key == "meta":
         return _load_meta(default, user_id)
     if file_key == "pending_reminders":
         return _load_pending_reminders(default, user_id)
     if file_key == "short_term_memory":
         return _load_short_term_memory(default, user_id)
-
-    path = FILES.get(file_key)
-    if not path or not os.path.exists(path):
-        return default if default is not None else []
-
-    lock = _get_file_lock(path)
-    with lock:
-        try:
-            with open(path, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        except json.JSONDecodeError as e:
-            logger.error(f"JSON 解析失败 {path}: {e}")
-            return default if default is not None else []
-        except IOError as e:
-            logger.warning(f"读取文件失败 {path}: {e}")
-            return default if default is not None else []
+    logger.error(f"未知的 file_key: {file_key}")
+    return default if default is not None else []
 
 def save_json(file_key: str, data: Any, user_id: Optional[str] = None) -> bool:
-    """保存数据到指定的 JSON 文件（原子性写入，线程安全）"""
+    """保存数据到指定的 JSON 数据（原子性写入，线程安全）"""
     if file_key == "meta":
         return _save_meta(data, user_id)
     if file_key == "pending_reminders":
         return _save_pending_reminders(data, user_id)
     if file_key == "short_term_memory":
         return _save_short_term_memory(data, user_id)
-
-    path = FILES.get(file_key)
-    if not path:
-        logger.error(f"未知的 file_key: {file_key}")
-        return False
-
-    lock = _get_file_lock(path)
-    temp_path = path + ".tmp"
-
-    with lock:
-        try:
-            with open(temp_path, 'w', encoding='utf-8') as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
-
-            # 原子性替换（Windows 需要先删除目标文件）
-            if os.path.exists(path):
-                os.replace(temp_path, path)
-            else:
-                os.rename(temp_path, path)
-            return True
-        except IOError as e:
-            logger.error(f"保存 {path} 失败: {e}")
-            # 清理临时文件
-            if os.path.exists(temp_path):
-                try:
-                    os.remove(temp_path)
-                except OSError:
-                    pass
-            return False
-        except TypeError as e:
-            logger.error(f"JSON 序列化失败 {path}: {e}")
-            if os.path.exists(temp_path):
-                try:
-                    os.remove(temp_path)
-                except OSError:
-                    pass
-            return False
+    logger.error(f"未知的 file_key: {file_key}")
+    return False
 
 # --- Amaya 记忆文件系统 API ---
 def _safe_user_id(user_id: str) -> str:
     return re.sub(r"[^a-zA-Z0-9_-]", "_", user_id or config.DEFAULT_USER_ID)
 
 
-def _migrate_legacy_default_memory_dir() -> None:
-    global _legacy_memory_migrated
-    if _legacy_memory_migrated:
-        return
-    _legacy_memory_migrated = True
-
-    default_dir = os.path.join(DATA_DIR, _safe_user_id(config.DEFAULT_USER_ID))
-    os.makedirs(default_dir, exist_ok=True)
-    try:
-        legacy_files = [
-            name for name in os.listdir(DATA_DIR)
-            if not name.startswith(".") and os.path.isfile(os.path.join(DATA_DIR, name))
-        ]
-    except OSError:
-        return
-
-    if not legacy_files:
-        return
-
-    try:
-        existing_files = {
-            name for name in os.listdir(default_dir)
-            if not name.startswith(".") and os.path.isfile(os.path.join(default_dir, name))
-        }
-    except OSError:
-        existing_files = set()
-
-    for name in legacy_files:
-        src = os.path.join(DATA_DIR, name)
-        dst = os.path.join(default_dir, name)
-        if name in existing_files:
-            logger.warning("Skip legacy memory file due to conflict: %s", name)
-            continue
-        try:
-            os.replace(src, dst)
-            logger.info("Migrated legacy memory file to default user dir: %s", name)
-        except OSError as e:
-            logger.warning("Failed to migrate legacy memory file %s: %s", name, e)
-
-
 def _get_user_memory_dir(user_id: Optional[str] = None) -> str:
     resolved_user_id = _safe_user_id(user_id or get_current_user_id())
-    if resolved_user_id == _safe_user_id(config.DEFAULT_USER_ID):
-        _migrate_legacy_default_memory_dir()
     path = os.path.join(DATA_DIR, resolved_user_id)
     os.makedirs(path, exist_ok=True)
     return path
@@ -765,6 +537,194 @@ def write_file_content(filename: str, content: str, user_id: Optional[str] = Non
     except Exception as e:
         logger.exception(f"写入文件 {filename} 时发生未知错误: {e}")
         return False
+
+def _default_schedule() -> dict:
+    return {
+        "version": 1,
+        "timezone": config.TIMEZONE,
+        "days": [],
+        "updated_at": datetime.now().isoformat(timespec="seconds")
+    }
+
+
+def build_schedule_item_id(existing_ids: Optional[set[str]] = None) -> str:
+    import secrets
+    existing_ids = existing_ids or set()
+    while True:
+        candidate = f"e{int(time.time() * 1000):x}{secrets.token_hex(2)}"
+        if candidate not in existing_ids:
+            return candidate
+
+
+def _normalize_schedule(data: Any) -> dict:
+    schedule = _default_schedule()
+    if not isinstance(data, dict):
+        return schedule
+
+    timezone = data.get("timezone") or schedule["timezone"]
+    schedule["timezone"] = timezone
+    schedule["version"] = data.get("version", schedule["version"])
+
+    days = data.get("days", [])
+    if not isinstance(days, list):
+        return schedule
+
+    normalized_days = []
+    for day in days:
+        if not isinstance(day, dict):
+            continue
+        date_str = str(day.get("date", "")).strip()
+        if not date_str:
+            continue
+        items = day.get("items", [])
+        if not isinstance(items, list):
+            items = []
+        normalized_items = []
+        existing_ids: set[str] = set()
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            title = str(item.get("title", "")).strip()
+            if not title:
+                continue
+            item_id = str(item.get("id") or build_schedule_item_id(existing_ids))
+            existing_ids.add(item_id)
+            tags = item.get("tags", [])
+            if not isinstance(tags, list):
+                tags = []
+            normalized_items.append({
+                "id": item_id,
+                "start": str(item.get("start", "")).strip(),
+                "end": str(item.get("end", "")).strip(),
+                "title": title,
+                "location": str(item.get("location", "")).strip(),
+                "note": str(item.get("note", "")).strip(),
+                "tags": tags
+            })
+        normalized_days.append({"date": date_str, "items": normalized_items})
+
+    schedule["days"] = sorted(normalized_days, key=lambda d: d.get("date", ""))
+    return schedule
+
+
+def load_schedule(user_id: Optional[str] = None) -> dict:
+    content = read_file_content(SCHEDULE_FILE, user_id=user_id)
+    if not content:
+        return _default_schedule()
+    try:
+        data = json.loads(content)
+    except json.JSONDecodeError as e:
+        logger.warning(f"{SCHEDULE_FILE} 解析失败: {e}")
+        return _default_schedule()
+    return _normalize_schedule(data)
+
+
+def save_schedule(schedule: dict, user_id: Optional[str] = None) -> bool:
+    if not isinstance(schedule, dict):
+        logger.error(f"{SCHEDULE_FILE} 保存失败：数据结构不是 dict")
+        return False
+    normalized = _normalize_schedule(schedule)
+    normalized["updated_at"] = datetime.now().isoformat(timespec="seconds")
+    try:
+        content = json.dumps(normalized, ensure_ascii=False, indent=2)
+    except TypeError as e:
+        logger.error(f"{SCHEDULE_FILE} 序列化失败: {e}")
+        return False
+    return write_file_content(SCHEDULE_FILE, content, user_id=user_id)
+
+
+def _parse_schedule_date(date_str: str) -> Optional[date]:
+    try:
+        return datetime.strptime(date_str, "%Y-%m-%d").date()
+    except (TypeError, ValueError):
+        return None
+
+
+def _time_to_minutes(time_str: str) -> Optional[int]:
+    if not time_str:
+        return None
+    try:
+        value = datetime.strptime(time_str, "%H:%M")
+    except (TypeError, ValueError):
+        return None
+    return value.hour * 60 + value.minute
+
+
+def _sort_schedule_items(items: list[dict]) -> list[dict]:
+    def _key(item: dict) -> tuple:
+        start = _time_to_minutes(item.get("start", ""))
+        return (start if start is not None else 24 * 60 + 1, item.get("title", ""))
+    return sorted(items, key=_key)
+
+
+def _format_schedule_item(item: dict) -> str:
+    parts = []
+    start = item.get("start", "")
+    end = item.get("end", "")
+    title = item.get("title", "")
+    if start and end:
+        parts.append(f"{start}-{end}")
+    elif start:
+        parts.append(start)
+    if title:
+        parts.append(title)
+    line = " ".join(parts) if parts else title
+    location = item.get("location", "")
+    if location:
+        line += f" @ {location}"
+    tags = item.get("tags") or []
+    if tags:
+        tag_str = " ".join(f"#{t}" for t in tags if t)
+        if tag_str:
+            line += f" {tag_str}"
+    note = item.get("note", "")
+    if note:
+        note_preview = note[:60]
+        line += f" | {note_preview}"
+    item_id = item.get("id", "")
+    if item_id:
+        line += f" (id: {item_id})"
+    return line
+
+
+def get_schedule_summary(
+    user_id: Optional[str] = None,
+    start_date: Optional[str] = None,
+    days: int = 7,
+    include_empty_today: bool = True
+) -> str:
+    schedule = load_schedule(user_id=user_id)
+    today = datetime.now().date()
+    start = _parse_schedule_date(start_date) if start_date else today
+    if start is None:
+        start = today
+    days = max(1, min(days, 14))
+
+    day_map = {d.get("date", ""): d for d in schedule.get("days", []) if isinstance(d, dict)}
+    lines = ["=== DAILY SCHEDULE ==="]
+    had_any = False
+    for offset in range(days):
+        day = start + timedelta(days=offset)
+        day_str = day.strftime("%Y-%m-%d")
+        items = day_map.get(day_str, {}).get("items", [])
+        include_empty = offset == 0 or (include_empty_today and day == today)
+        if not items and not include_empty:
+            continue
+        lines.append(f"{day_str}:")
+        if not items:
+            lines.append("- (暂无安排)")
+            continue
+        had_any = True
+        sorted_items = _sort_schedule_items(items)
+        max_items = 10
+        for item in sorted_items[:max_items]:
+            lines.append(f"- {_format_schedule_item(item)}")
+        if len(sorted_items) > max_items:
+            lines.append(f"- ... 还有 {len(sorted_items) - max_items} 项未展示")
+
+    if not had_any and not include_empty_today:
+        return "=== DAILY SCHEDULE ===\n- (暂无安排)"
+    return "\n".join(lines)
 
 def delete_file(filename, user_id: Optional[str] = None):
     """删除记忆库中的文件"""
@@ -835,9 +795,9 @@ def get_global_context_string(user_id: Optional[str] = None):
     聚合所有 Amaya 需要"默认"看见的信息。
     包括：
     1. Pinned Files (用户手动置顶)
-    2. Default Files (系统默认可见，如 routine.md)
-    3. Pending Reminders (当前的提醒列表)
-    4. etc
+    2. Default Files (系统默认可见，如 routine.json)
+    3. Structured Schedule Summary (结构化日程表摘要)
+    4. Pending Reminders (当前的提醒列表)
     """
     context_parts = []
     resolved_user_id = user_id or get_current_user_id()
@@ -851,6 +811,8 @@ def get_global_context_string(user_id: Optional[str] = None):
     for f in config.DEFAULT_VISIBLE_FILES:
         if os.path.exists(os.path.join(dir_path, f)):
             pinned_set.add(f)
+    if SCHEDULE_FILE in pinned_set:
+        pinned_set.remove(SCHEDULE_FILE)
 
     # 3. 读取并组装内容
     if pinned_set:
@@ -861,7 +823,12 @@ def get_global_context_string(user_id: Optional[str] = None):
                 # 加上文件名作为标题，方便 AI 区分
                 context_parts.append(f"\n--- FILE: {fname} ---\n{content}")
 
-    # 4. 注入 Pending Reminders (这能有效防止重复设置提醒！)
+    # 4. 注入结构化日程表摘要
+    schedule_summary = get_schedule_summary(user_id=resolved_user_id)
+    if schedule_summary:
+        context_parts.append(f"\n{schedule_summary}")
+
+    # 5. 注入 Pending Reminders (这能有效防止重复设置提醒！)
     reminders_summary = get_pending_reminders_summary(user_id=resolved_user_id)
     context_parts.append(f"\n=== ACTIVE TIMERS (PENDING) ===\n{reminders_summary}")
 

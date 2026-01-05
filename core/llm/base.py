@@ -34,9 +34,6 @@ class ChatMessage:
     @classmethod
     def from_dict(cls, data: dict) -> "ChatMessage":
         role_str = data.get("role", "user")
-        # 兼容旧格式：model -> assistant
-        if role_str == "model":
-            role_str = "assistant"
         return cls(
             role=MessageRole(role_str),
             text=data.get("text", ""),

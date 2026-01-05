@@ -6,8 +6,8 @@
 - **核心档案（常驻上下文）**：
   - `user_profile.md`：性格、偏好、重要联系人、禁忌。
   - `current_goals.md`：当前 3-5 个目标，附状态与下一步行动。
-  - `plan.md`：近期日程/安排，与 Routine 关联。
-  - `routine.json`：结构化的作息模板与默认时间窗。
+  - `plan.md`：近期日程/安排，与结构化日程表关联。
+  - `routine.json`：结构化日程表（按天记录，覆盖课程/自习/活动等）。
 - **任务与项目**：
   - `projects/<project_name>.md`：单项目概览，包含目标、里程碑、风险、下一步。
   - `tasks/<yyyy-mm>.md`：当月任务列表与完成记录；跨月迁移未完任务。
@@ -16,6 +16,7 @@
   - `journal_summary_<yyyy>.md`：按月/季度追加摘要，避免日记碎片膨胀。
 - **资料与清单**：
   - `references/<topic>.md`：常用模板、决策准则、健康/学习 checklist。
+  - `course_schedule.md`：原始课表（可选），用于提取未来 2-3 天并写入 `routine.json`。
 
 ## 内容与体积控制
 - 每个文件建议不超过 **1,200 词或 80 KB**；超过阈值时必须拆分或摘要。

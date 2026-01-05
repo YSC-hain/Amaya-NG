@@ -24,7 +24,7 @@ class AmayaBrain:
         self._init_llm_provider()
 
         # 2. 短期记忆缓存（按用户隔离）
-        # 结构: {user_id: [{"role": "user/model", "text": "...", "timestamp": 123456789}]}
+        # 结构: {user_id: [{"role": "user/assistant", "text": "...", "timestamp": 123456789}]}
         self.short_term_memory: dict[str, list[dict]] = {}
 
         # 核心人设
@@ -214,7 +214,7 @@ class AmayaBrain:
                 # 更新短期记忆库
                 current_time = time.time()
                 memory.append({"role": "user", "text": user_text, "timestamp": current_time})
-                memory.append({"role": "model", "text": response_text, "timestamp": current_time})
+                memory.append({"role": "assistant", "text": response_text, "timestamp": current_time})
 
                 # 保存短期记忆
                 self._save_short_term_memory(resolved_user_id, memory)
@@ -246,7 +246,6 @@ class AmayaBrain:
     ) -> str:
         """
         异步版本的 chat 方法，内部调用 chat_sync。
-        保留此方法以保持向后兼容性（如 tidying_up 等内部调用）。
         """
         import asyncio
         return await asyncio.to_thread(
