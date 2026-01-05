@@ -12,6 +12,7 @@ from typing import List, Optional, Callable, Any, get_type_hints
 
 import config
 from utils.logging_setup import get_request_id
+from utils.user_context import get_current_user_id
 from openai import OpenAI
 from openai import APIError, APIConnectionError, RateLimitError
 
@@ -306,6 +307,7 @@ class OpenAIProvider(LLMProvider):
         """
         log_full_payload = config.LOG_LLM_PAYLOADS == "full"
         request_id = get_request_id()
+        user_id = get_current_user_id()
         model_name = self.get_model_name(use_smart_model)
         request_payload = None
         if log_full_payload:
@@ -328,6 +330,7 @@ class OpenAIProvider(LLMProvider):
             payload = {
                 "timestamp": time.time(),
                 "request_id": request_id,
+                "user_id": user_id,
                 "provider": self.provider_name,
                 "model": model_name,
                 "use_smart": use_smart_model,

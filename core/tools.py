@@ -15,6 +15,7 @@ from utils.storage import (
     build_reminder_id,
     append_event_to_bus
 )
+from utils.user_context import get_current_user_id
 
 logger = logging.getLogger("Amaya.Tools")
 
@@ -137,9 +138,11 @@ def schedule_reminder(delay_seconds: Optional[int] = None, prompt: str = "", tar
         return "请提供 delay_seconds 或 target_time。"
 
     reminder_id = build_reminder_id(run_at)
+    user_id = get_current_user_id()
     event = {
         "type": "reminder",
         "id": reminder_id,
+        "user_id": user_id,
         "created_at": now,
         "run_at": run_at,
         "prompt": prompt
@@ -162,9 +165,11 @@ def clear_reminder(reminder_id: str) -> str:
     if not reminder_id:
         return "错误：缺少 reminder_id 参数。"
 
+    user_id = get_current_user_id()
     event = {
         "type": "clear_reminder",
-        "reminder_id": reminder_id
+        "reminder_id": reminder_id,
+        "user_id": user_id
     }
 
     if append_event_to_bus(event):
@@ -187,7 +192,7 @@ def get_weather(city: str) -> str:
         return "请提供城市名称，例如 Shanghai。"
     try:
         url = f"https://wttr.in/{requests.utils.quote(city)}?format=3&lang=zh"
-        response = requests.get(url, timeout=8, headers={"User-Agent": "Amaya/1.0"})
+        response = requests.get(url, timeout=config.WEATHER_TIMEOUT_SECONDS, headers={"User-Agent": "Amaya/1.0"})
         if response.status_code == 200:
             return f"{city} 天气: {response.text.strip()}"
         return f"无法获取 {city} 的天气信息，HTTP {response.status_code}。"
@@ -210,7 +215,7 @@ def get_china_holiday(date_str: Optional[str] = None) -> str:
     try:
         url = f"https://timor.tech/api/holiday/info/{date_str}"
         headers = {"User-Agent": "Amaya/1.0"}
-        response = requests.get(url, headers=headers, timeout=8)
+        response = requests.get(url, headers=headers, timeout=config.HOLIDAY_TIMEOUT_SECONDS)
         data = response.json()
 
         if data.get("code") != 0:

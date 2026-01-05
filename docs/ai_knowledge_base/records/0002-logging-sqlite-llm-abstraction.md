@@ -1,4 +1,4 @@
-# 0002 日志结构化与 SQLite 存储改造
+﻿# 0002 日志结构化与 SQLite 存储改造
 
 - 日期: 2026-01-05
 - 状态: active
@@ -28,7 +28,7 @@
 
 ## 3. 设计与实现 (Design & Implementation)
 - LLM 抽象：将音频转写逻辑下沉到 OpenAI Provider，Agent 不再直接依赖 OpenAI SDK。
-- 日志：引入 request_id 关联，按模块分文件（app/llm/event/error/payload），按天轮转；payload 以 JSON 行输出。
+- 日志：引入 request_id 关联，按模块分文件（app/llm/event/error/payload），按天轮转；payload 用 JSON 行输出。
 - 存储：meta/pending_reminders/short_term_memory/sys_events 迁移到 SQLite，事件读取标记 processed/invalid；保留旧 JSON 文件作为回退。
 - 调试：新增 `scripts/db_inspect.py` 查询 DB 表与样例数据。
 

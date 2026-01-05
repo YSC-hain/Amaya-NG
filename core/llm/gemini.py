@@ -15,6 +15,7 @@ from google.genai import types
 
 import config
 from utils.logging_setup import get_request_id
+from utils.user_context import get_current_user_id
 from core.llm.base import (
     LLMProvider,
     ChatMessage,
@@ -126,6 +127,7 @@ class GeminiProvider(LLMProvider):
         """发送消息并获取响应"""
         log_full_payload = config.LOG_LLM_PAYLOADS == "full"
         request_id = get_request_id()
+        user_id = get_current_user_id()
         model_name = self.get_model_name(use_smart_model)
         request_payload = None
         if log_full_payload:
@@ -146,6 +148,7 @@ class GeminiProvider(LLMProvider):
             payload = {
                 "timestamp": time.time(),
                 "request_id": request_id,
+                "user_id": user_id,
                 "provider": self.provider_name,
                 "model": model_name,
                 "use_smart": use_smart_model,
@@ -167,7 +170,7 @@ class GeminiProvider(LLMProvider):
             # 创建配置
             config_kwargs = {
                 "system_instruction": system_instruction,
-                "temperature": 0.7,
+                "temperature": config.GEMINI_TEMPERATURE,
             }
 
             # 只有当有工具时才添加工具配置

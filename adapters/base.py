@@ -11,10 +11,11 @@ class MessageSender(ABC):
     """消息发送协议"""
 
     @abstractmethod
-    async def send_text(self, text: str, parse_mode: Optional[str] = None) -> bool:
+    async def send_text(self, user_id: str, text: str, parse_mode: Optional[str] = None) -> bool:
         """
         向 OWNER 发送文本消息。
         Args:
+            user_id: 内部用户 ID
             text: 消息正文
             parse_mode: 可选的格式化模式 (如 "Markdown", "HTML")
         Returns:

@@ -13,6 +13,7 @@ from core.llm import create_llm_provider, ChatMessage, MultimodalInput
 from core.tools import tools_registry
 from utils.storage import get_global_context_string, load_json, save_json
 from utils.logging_setup import request_context
+from utils.user_context import user_context, get_current_user_id
 
 logger = logging.getLogger("Amaya.Agent")
 
@@ -22,9 +23,9 @@ class AmayaBrain:
         # 1. 根据配置创建 LLM 提供者
         self._init_llm_provider()
 
-        # 2. 短期记忆缓存
-        # 结构: [{"role": "user/model", "text": "...", "timestamp": 123456789}]
-        self.short_term_memory = self._load_short_term_memory()
+        # 2. 短期记忆缓存（按用户隔离）
+        # 结构: {user_id: [{"role": "user/model", "text": "...", "timestamp": 123456789}]}
+        self.short_term_memory: dict[str, list[dict]] = {}
 
         # 核心人设
         self.system_instruction = config.CHAT_SYSTEM_PROMPT
@@ -56,27 +57,32 @@ class AmayaBrain:
 
         logger.info(f"LLM Provider 初始化: {self.llm.provider_name}")
 
-    def _load_short_term_memory(self) -> list:
-        """从持久化存储加载短期记忆"""
+    def _load_short_term_memory(self, user_id: str) -> list:
+        """从持久化存储加载短期记忆（按用户）"""
         try:
-            memory = load_json("short_term_memory", default=[])
+            memory = load_json("short_term_memory", default=[], user_id=user_id)
             if not isinstance(memory, list):
                 logger.warning("短期记忆格式异常，已重置")
                 return []
             # 过滤掉过期的记忆
             cutoff = time.time() - config.SHORT_TERM_MEMORY_TTL
             valid_memory = [m for m in memory if m.get("timestamp", 0) > cutoff]
-            logger.info(f"已加载 {len(valid_memory)} 条短期记忆")
+            logger.info("已加载短期记忆 user_id=%s count=%s", user_id, len(valid_memory))
             return valid_memory
         except Exception as e:
             logger.error(f"加载短期记忆失败: {e}")
             return []
 
-    def _save_short_term_memory(self):
-        """持久化保存短期记忆"""
+    def _get_short_term_memory(self, user_id: str) -> list:
+        if user_id not in self.short_term_memory:
+            self.short_term_memory[user_id] = self._load_short_term_memory(user_id)
+        return self.short_term_memory[user_id]
+
+    def _save_short_term_memory(self, user_id: str, memory: list):
+        """持久化保存短期记忆（按用户）"""
         try:
-            if save_json("short_term_memory", self.short_term_memory):
-                logger.debug(f"已保存 {len(self.short_term_memory)} 条短期记忆")
+            if save_json("short_term_memory", memory, user_id=user_id):
+                logger.debug("已保存短期记忆 user_id=%s count=%s", user_id, len(memory))
             else:
                 logger.warning("短期记忆保存失败")
         except Exception as e:
@@ -85,22 +91,23 @@ class AmayaBrain:
     def shutdown(self):
         """优雅关闭，保存状态"""
         logger.info("正在保存 Amaya 状态...")
-        self._save_short_term_memory()
+        for user_id, memory in self.short_term_memory.items():
+            self._save_short_term_memory(user_id, memory)
         logger.info("Amaya 状态已保存")
 
-    def _get_cleaned_history(self) -> list[ChatMessage]:
+    def _get_cleaned_history(self, memory: list[dict]) -> list[ChatMessage]:
         """剔除过期的历史记录，返回 ChatMessage 列表"""
         cutoff = time.time() - config.SHORT_TERM_MEMORY_TTL
-        self.short_term_memory = [m for m in self.short_term_memory if m.get("timestamp", 0) > cutoff]
+        memory[:] = [m for m in memory if m.get("timestamp", 0) > cutoff]
 
         # 转换为统一的 ChatMessage 格式
         messages = []
-        for m in self.short_term_memory:
+        for m in memory:
             messages.append(ChatMessage.from_dict(m))
         # 限制总条数，保留最新的记录
         if len(messages) > config.SHORT_TERM_MEMORY_MAX_ENTRIES:
             messages = messages[-config.SHORT_TERM_MEMORY_MAX_ENTRIES:]
-            self.short_term_memory = [m.to_dict() for m in messages]
+            memory[:] = [m.to_dict() for m in messages]
         return messages
 
     def get_world_background(self):
@@ -116,17 +123,19 @@ class AmayaBrain:
         image_bytes: bytes = b'',
         audio_bytes: bytes = b'',
         audio_mime: str = "audio/ogg",
-        request_id: str | None = None
+        request_id: str | None = None,
+        user_id: str | None = None
     ) -> str:
         """
         同步版本的 chat 方法，用于在线程池中执行。
         这样可以避免阻塞主事件循环，让 typing 指示器正常工作。
         """
-        with request_context(request_id):
+        with request_context(request_id), user_context(user_id):
+            resolved_user_id = user_id or get_current_user_id()
+
             # 动态选择模型
             # 如果涉及规划、反思、大量文件操作，切换到 Smart 模型
-            logic_keywords = ["规划", "计划", "安排", "整理", "复盘", "反思", "分析", "schedule", "plan"]
-            use_smart = (image_bytes or audio_bytes) or any(k in user_text for k in logic_keywords)
+            use_smart = (image_bytes or audio_bytes) or any(k in user_text for k in config.LOGIC_KEYWORDS)
             start_time = time.time()
             selected_model = self.llm.get_model_name(use_smart)
 
@@ -135,7 +144,8 @@ class AmayaBrain:
                 global_context = get_global_context_string()
 
                 # 获取并清理短期对话历史
-                history = self._get_cleaned_history()
+                memory = self._get_short_term_memory(resolved_user_id)
+                history = self._get_cleaned_history(memory)
                 logger.debug(
                     "上下文准备完成 history=%s global_context_chars=%s",
                     len(history),
@@ -192,7 +202,7 @@ class AmayaBrain:
                     multimodal_input=multimodal_input,
                     tools=tools_registry,
                     use_smart_model=use_smart,
-                    max_tool_calls=10
+                    max_tool_calls=config.LLM_MAX_TOOL_CALLS
                 )
 
                 response_text = response.text
@@ -203,11 +213,11 @@ class AmayaBrain:
 
                 # 更新短期记忆库
                 current_time = time.time()
-                self.short_term_memory.append({"role": "user", "text": user_text, "timestamp": current_time})
-                self.short_term_memory.append({"role": "model", "text": response_text, "timestamp": current_time})
+                memory.append({"role": "user", "text": user_text, "timestamp": current_time})
+                memory.append({"role": "model", "text": response_text, "timestamp": current_time})
 
                 # 保存短期记忆
-                self._save_short_term_memory()
+                self._save_short_term_memory(resolved_user_id, memory)
 
                 elapsed = time.time() - start_time
                 logger.info(
@@ -231,7 +241,8 @@ class AmayaBrain:
         image_bytes: bytes = b'',
         audio_bytes: bytes = b'',
         audio_mime: str = "audio/ogg",
-        request_id: str | None = None
+        request_id: str | None = None,
+        user_id: str | None = None
     ) -> str:
         """
         异步版本的 chat 方法，内部调用 chat_sync。
@@ -239,7 +250,7 @@ class AmayaBrain:
         """
         import asyncio
         return await asyncio.to_thread(
-            self.chat_sync, user_text, image_bytes, audio_bytes, audio_mime, request_id
+            self.chat_sync, user_text, image_bytes, audio_bytes, audio_mime, request_id, user_id
         )
 
     async def tidying_up(self):

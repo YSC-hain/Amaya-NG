@@ -7,6 +7,7 @@
 - **核心 Agent**：`core/agent.py` 的 `AmayaBrain.chat_sync` 负责整理上下文、选择模型、调用 LLM，并维护短期记忆。
 - **LLM 抽象层**：`core/llm/base.py` 定义统一接口；工厂 `core/llm/factory.py` 根据配置创建具体 Provider（OpenAI/Gemini）。
 - **Provider 实现**：`core/llm/openai.py` 与 `core/llm/gemini.py` 按各自 API 协议组装请求，执行工具调用循环并返回 `ChatResponse`。
+- **多用户上下文**：适配器会解析平台用户并映射到内部 `user_id`，通过上下文隔离记忆与提醒数据。
 
 ## 运行模式与调用路径
 - **日常对话**：Telegram 适配器经 `chat_handler/photo_handler/voice_handler` → `ChatSessionBuffer` 聚合 → `AmayaBrain.chat_sync` → Provider。

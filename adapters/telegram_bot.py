@@ -20,16 +20,25 @@ from telegram.error import TelegramError, NetworkError
 import config
 from adapters.base import MessageSender
 from core.agent import amaya
-from utils.storage import get_pending_reminders_summary
+from utils.storage import (
+    get_pending_reminders_summary,
+    resolve_user_id,
+    get_external_id,
+    lookup_user_id,
+    create_user,
+    link_user_mapping,
+)
 from utils.logging_setup import request_context
+from utils.user_context import user_context
 
 logger = logging.getLogger("Amaya.Telegram")
 
 # Telegram 消息长度限制
-MAX_MESSAGE_LENGTH = 4096
-ALLOWED_AUDIO_MIME = {"audio/ogg", "audio/webm", "audio/wav", "audio/flac", "audio/mp3", "audio/mpeg"}
+MAX_MESSAGE_LENGTH = config.TELEGRAM_MAX_MESSAGE_LENGTH
+ALLOWED_AUDIO_MIME = set(config.TELEGRAM_ALLOWED_AUDIO_MIME)
 # 多消息缓冲窗口（秒，可在 config 中调节）
 RAPID_MESSAGE_BUFFER_SECONDS = config.RAPID_MESSAGE_BUFFER_SECONDS
+UNAUTHORIZED_TEXT = "未授权。请联系管理员绑定账号。"
 
 
 # --- 工具函数 ---
@@ -82,13 +91,34 @@ async def _send_with_fallback(message, text: str, parse_mode: str = "Markdown"):
 
 # --- 权限控制 ---
 def _is_authorized(chat_id: int) -> bool:
-    if not config.OWNER_ID:
-        logger.error("OWNER_ID 未配置，拒绝所有请求。")
+    if not config.REQUIRE_AUTH:
+        return True
+    allowed = set(config.ALLOWED_USER_IDS)
+    allowed.update(config.ADMIN_USER_IDS)
+    if config.OWNER_ID:
+        allowed.add(str(config.OWNER_ID))
+    if not allowed:
+        logger.error("Auth required but allowlist is empty; denying all users.")
         return False
-    return str(chat_id) == str(config.OWNER_ID)
+    return str(chat_id) in allowed
 
 
-async def _typing_spinner(context: ContextTypes.DEFAULT_TYPE, chat_id: int, stop_event: asyncio.Event, interval: float = 3.0):
+def _is_admin(chat_id: int) -> bool:
+    if config.ADMIN_USER_IDS:
+        return str(chat_id) in config.ADMIN_USER_IDS
+    if config.OWNER_ID:
+        return str(chat_id) == str(config.OWNER_ID)
+    if config.ALLOWED_USER_IDS:
+        return str(chat_id) in config.ALLOWED_USER_IDS
+    return False
+
+
+async def _typing_spinner(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    stop_event: asyncio.Event,
+    interval: float = config.TELEGRAM_TYPING_INTERVAL
+):
     """
     循环发送 typing 状态，直至 stop_event 触发。
     Telegram 的 typing 状态持续约 5 秒，所以我们每 3 秒刷新一次。
@@ -152,12 +182,12 @@ class ChatSessionBuffer:
     def __init__(self, chat_id: int, buffer_seconds: float = RAPID_MESSAGE_BUFFER_SECONDS):
         self.chat_id = chat_id
         self.buffer_seconds = buffer_seconds
-        self.queue: List[Tuple[str, object, str]] = []
+        self.queue: List[Tuple[str, object, str, str]] = []
         self.processing = False
         self.new_message_event = asyncio.Event()
 
-    def enqueue(self, user_text: str, message_obj, request_id: str) -> None:
-        self.queue.append((user_text, message_obj, request_id))
+    def enqueue(self, user_text: str, message_obj, request_id: str, user_id: str) -> None:
+        self.queue.append((user_text, message_obj, request_id, user_id))
         self.new_message_event.set()
 
     async def process(self, context: ContextTypes.DEFAULT_TYPE):
@@ -192,8 +222,8 @@ class ChatSessionBuffer:
                 self.new_message_event.clear()
 
                 responses: List[Tuple[str, str]] = []
-                for user_text, message_obj, request_id in batch:
-                    with request_context(request_id):
+                for user_text, message_obj, request_id, user_id in batch:
+                    with request_context(request_id), user_context(user_id):
                         try:
                             logger.info(
                                 "处理文本消息 chat_id=%s len=%s",
@@ -201,7 +231,7 @@ class ChatSessionBuffer:
                                 len(user_text or ""),
                             )
                             resp = await asyncio.to_thread(
-                                amaya.chat_sync, user_text, request_id=request_id
+                                amaya.chat_sync, user_text, request_id=request_id, user_id=user_id
                             )
                         except Exception as e:
                             logger.error(f"聊天处理异常: {e}")
@@ -246,23 +276,28 @@ class TelegramSender(MessageSender):
     def __init__(self, bot):
         self.bot = bot
 
-    async def send_text(self, text: str, parse_mode: Optional[str] = "Markdown") -> bool:
-        if not config.OWNER_ID:
-            logger.error("OWNER_ID 未配置，无法发送消息。")
+    async def send_text(self, user_id: str, text: str, parse_mode: Optional[str] = "Markdown") -> bool:
+        chat_id = get_external_id(user_id, "telegram")
+        if not chat_id:
+            logger.error("未找到用户映射，无法发送消息 user_id=%s", user_id)
             return False
+        try:
+            chat_id = int(chat_id)
+        except (TypeError, ValueError):
+            pass
 
         chunks = _split_message(text)
         success = True
         for chunk in chunks:
             try:
                 await self.bot.send_message(
-                    chat_id=config.OWNER_ID,
+                    chat_id=chat_id,
                     text=chunk,
                     parse_mode=parse_mode,
                 )
             except TelegramError:
                 try:
-                    await self.bot.send_message(chat_id=config.OWNER_ID, text=chunk)
+                    await self.bot.send_message(chat_id=chat_id, text=chunk)
                 except TelegramError as e:
                     logger.error(f"消息发送失败: {e}")
                     success = False
@@ -275,18 +310,19 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     chat_id = update.effective_chat.id
     if not _is_authorized(chat_id):
-        await update.message.reply_text("未授权。仅限 OWNER 使用。")
+        await update.message.reply_text(UNAUTHORIZED_TEXT)
         return
+    user_id = resolve_user_id("telegram", str(chat_id), user.first_name)
     logger.info(f"User {user.first_name} started the bot. Chat ID: {chat_id}")
     await update.message.reply_text(
-        f"你好，{user.first_name}。\n我是 Amaya 原型机。\nID: `{chat_id}`",
+        f"你好，{user.first_name}。\n我是 Amaya 原型机。\nID: `{chat_id}`\nUID: `{user_id}`",
         parse_mode="Markdown",
     )
 
 
 async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _is_authorized(update.effective_chat.id):
-        await update.message.reply_text("未授权。仅限 OWNER 使用。")
+        await update.message.reply_text(UNAUTHORIZED_TEXT)
         return
     await update.message.reply_text("Pong! 系统在线。")
 
@@ -294,32 +330,104 @@ async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """显示帮助信息"""
     if not _is_authorized(update.effective_chat.id):
-        await update.message.reply_text("未授权。仅限 OWNER 使用。")
+        await update.message.reply_text(UNAUTHORIZED_TEXT)
         return
     help_text = (
-        "*Amaya 使用指南*\n\n"
-        "  *日常对话* - 直接发送消息即可\n"
-        "  *图片理解* - 发送图片并附带说明\n"
-        "  *语音消息* - 发送语音，我会理解内容\n\n"
-        "*可用命令:*\n"
-        "/start - 查看 Bot 信息\n"
-        "/ping - 检查系统状态\n"
-        "/reminders - 查看待执行的提醒\n"
-        "/help - 显示此帮助\n\n"
-        "*提醒示例:*\n"
-        "• \"10分钟后提醒我喝水\"\n"
-        "• \"明天早上8点叫我起床\""
+        "*Amaya ????*\n\n"
+        "  *????* - ????????\n"
+        "  *????* - ?????????\n"
+        "  *????* - ???????????\n\n"
+        "*????:*\n"
+        "/start - ?? Bot ??\n"
+        "/ping - ??????\n"
+        "/reminders - ????????\n"
+        "/whoami - ??????\n"
+        "/user_create - ????(???)\n"
+        "/user_link - ?? telegram_id ? user_id(???)\n"
+        "/help - ?????\n\n"
+        "*????:*\n"
+        "\"10????????\"\n"
+        "\"????8?????\""
     )  # ToDo
     await update.message.reply_text(help_text, parse_mode="Markdown")
 
 
+async def whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    if not _is_authorized(chat_id):
+        await update.message.reply_text(UNAUTHORIZED_TEXT)
+        return
+    user_id = lookup_user_id("telegram", str(chat_id))
+    if user_id:
+        text = f"chat_id: `{chat_id}`
+user_id: `{user_id}`"
+    else:
+        text = f"chat_id: `{chat_id}`
+???? user_id?"
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+
+async def user_create(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    if not _is_admin(chat_id):
+        await update.message.reply_text(UNAUTHORIZED_TEXT)
+        return
+    display_name = " ".join(context.args).strip() or None
+    user_id = create_user(display_name)
+    message = f"??????
+user_id: `{user_id}`"
+    if display_name:
+        message += f"
+name: {display_name}"
+    await update.message.reply_text(message, parse_mode="Markdown")
+
+
+async def user_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    if not _is_admin(chat_id):
+        await update.message.reply_text(UNAUTHORIZED_TEXT)
+        return
+
+    args = list(context.args)
+    force = False
+    if "--force" in args:
+        args.remove("--force")
+        force = True
+
+    if len(args) < 2:
+        await update.message.reply_text(
+            "??: /user_link <telegram_id> <user_id> [display_name] [--force]"
+        )
+        return
+
+    telegram_id, user_id = args[0], args[1]
+    display_name = " ".join(args[2:]).strip() or None
+    ok = link_user_mapping(
+        "telegram",
+        telegram_id,
+        user_id,
+        display_name=display_name,
+        force=force,
+    )
+    if ok:
+        await update.message.reply_text(
+            f"???: telegram_id={telegram_id} -> user_id={user_id}",
+        )
+    else:
+        await update.message.reply_text("??????????????????? --force ???")
+
+
 async def reminders(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """查看挂起的提醒任务"""
-    if not _is_authorized(update.effective_chat.id):
-        await update.message.reply_text("未授权。仅限 OWNER 使用。")
+    chat_id = update.effective_chat.id
+    if not _is_authorized(chat_id):
+        await update.message.reply_text(UNAUTHORIZED_TEXT)
         return
+    user = update.effective_user
+    user_id = resolve_user_id("telegram", str(chat_id), user.first_name)
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
-    summary = get_pending_reminders_summary()
+    with user_context(user_id):
+        summary = get_pending_reminders_summary()
     keyboard = [
         [InlineKeyboardButton("刷新", callback_data="refresh_reminders")],
         [InlineKeyboardButton("关闭", callback_data="close_reminders")],
@@ -330,11 +438,14 @@ async def reminders(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    if not _is_authorized(query.from_user.id):
-        await query.edit_message_text("未授权。")
+    chat_id = query.from_user.id
+    if not _is_authorized(chat_id):
+        await query.edit_message_text(UNAUTHORIZED_TEXT)
         return
+    user_id = resolve_user_id("telegram", str(chat_id), query.from_user.first_name)
     if query.data == "refresh_reminders":
-        summary = get_pending_reminders_summary()
+        with user_context(user_id):
+            summary = get_pending_reminders_summary()
         keyboard = [
             [InlineKeyboardButton("刷新", callback_data="refresh_reminders")],
             [InlineKeyboardButton("关闭", callback_data="close_reminders")],
@@ -350,15 +461,17 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def chat_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text
     chat_id = update.effective_chat.id
+    user = update.effective_user
 
     if not _is_authorized(chat_id):
-        await update.message.reply_text("未授权。仅限 OWNER 使用。")
+        await update.message.reply_text(UNAUTHORIZED_TEXT)
         return
 
     with request_context() as request_id:
+        user_id = resolve_user_id("telegram", str(chat_id), user.first_name)
         logger.info("收到文本消息 chat_id=%s len=%s", chat_id, len(user_text or ""))
         session = CHAT_BUFFERS.setdefault(chat_id, ChatSessionBuffer(chat_id))
-        session.enqueue(user_text, update.message, request_id)
+        session.enqueue(user_text, update.message, request_id, user_id)
 
     # 独立任务处理队列，允许新的消息快速返回（合并后统一回复）
     if not session.processing:
@@ -367,16 +480,18 @@ async def chat_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _is_authorized(update.effective_chat.id):
-        await update.message.reply_text("未授权。仅限 OWNER 使用。")
+        await update.message.reply_text(UNAUTHORIZED_TEXT)
         return
 
     chat_id = update.effective_chat.id
+    user = update.effective_user
     stop_event = asyncio.Event()
     spinner = asyncio.create_task(_typing_spinner(context, chat_id, stop_event))
     await asyncio.sleep(0)  # 让出控制权
 
     response_text = None
     with request_context() as request_id:
+        user_id = resolve_user_id("telegram", str(chat_id), user.first_name)
         try:
             photo = update.message.photo[-1]
             file = await context.bot.get_file(photo.file_id)
@@ -394,6 +509,7 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 caption,
                 image_bytes=bytes(image_bytes),
                 request_id=request_id,
+                user_id=user_id,
             )
         except Exception as e:
             logger.error(f"图片处理失败: {e}")
@@ -412,7 +528,7 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def voice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """处理语音消息（下载 OGG/OPUS 并传递给 Gemini）。"""
     if not _is_authorized(update.effective_chat.id):
-        await update.message.reply_text("未授权。仅限 OWNER 使用。")
+        await update.message.reply_text(UNAUTHORIZED_TEXT)
         return
 
     voice = update.message.voice
@@ -421,12 +537,14 @@ async def voice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     chat_id = update.effective_chat.id
+    user = update.effective_user
     stop_event = asyncio.Event()
     spinner = asyncio.create_task(_typing_spinner(context, chat_id, stop_event))
     await asyncio.sleep(0)  # 让出控制权
 
     response_text = None
     with request_context() as request_id:
+        user_id = resolve_user_id("telegram", str(chat_id), user.first_name)
         try:
             file = await context.bot.get_file(voice.file_id)
             audio_bytes = await file.download_as_bytearray()
@@ -449,6 +567,7 @@ async def voice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     audio_bytes=audio_bytes,
                     audio_mime=mime_type,
                     request_id=request_id,
+                    user_id=user_id,
                 )
         except TelegramError as e:
             logger.error(f"语音下载失败: {e}")
@@ -472,6 +591,9 @@ def register_handlers(application):
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("ping", ping))
     application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("whoami", whoami))
+    application.add_handler(CommandHandler("user_create", user_create))
+    application.add_handler(CommandHandler("user_link", user_link))
     application.add_handler(CommandHandler("reminders", reminders))
     application.add_handler(CallbackQueryHandler(handle_callback))
     application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), chat_handler))

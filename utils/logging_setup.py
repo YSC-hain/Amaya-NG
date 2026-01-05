@@ -12,6 +12,7 @@ from contextlib import contextmanager
 from logging.handlers import TimedRotatingFileHandler
 from typing import Optional
 
+from utils.user_context import get_current_user_id
 
 _request_id_var: contextvars.ContextVar[str] = contextvars.ContextVar("request_id", default="-")
 
@@ -42,6 +43,7 @@ class RequestIdFilter(logging.Filter):
 
     def filter(self, record: logging.LogRecord) -> bool:
         record.request_id = _request_id_var.get("-")
+        record.user_id = get_current_user_id()
         return True
 
 
@@ -117,7 +119,7 @@ def setup_logging(
         },
         "formatters": {
             "standard": {
-                "format": "%(asctime)s - %(levelname)s - %(name)s - %(request_id)s - %(message)s"
+                "format": "%(asctime)s - %(levelname)s - %(name)s - %(request_id)s - %(user_id)s - %(message)s"
             },
             "payload": {
                 "format": "%(message)s"

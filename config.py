@@ -23,6 +23,13 @@ def _env_log_level(name: str, default: int) -> int:
     return value if isinstance(value, int) else default
 
 
+def _env_list(name: str) -> list[str]:
+    raw = os.getenv(name, "")
+    if not raw:
+        return []
+    return [item.strip() for item in raw.split(",") if item.strip()]
+
+
 LOG_DIR = os.getenv("LOG_DIR", "data/logs")
 LOG_LEVEL = _env_log_level("LOG_LEVEL", logging.INFO)
 LIBRARY_LOG_LEVEL = _env_log_level("LIBRARY_LOG_LEVEL", logging.WARNING)
@@ -35,6 +42,11 @@ if LOG_LLM_PAYLOADS not in ("preview", "full", "off"):
 LOG_BACKUP_COUNT = LOG_RETENTION_DAYS
 
 DB_PATH = os.getenv("AMAYA_DB_PATH", os.path.join("data", "amaya.db"))
+
+DEFAULT_USER_ID = os.getenv("DEFAULT_USER_ID", "default")
+ALLOWED_USER_IDS = _env_list("ALLOWED_USER_IDS")
+ADMIN_USER_IDS = _env_list("ADMIN_USER_IDS")
+REQUIRE_AUTH = os.getenv("REQUIRE_AUTH", "true").lower() == "true"
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 OWNER_ID = os.getenv("OWNER_ID")
@@ -62,8 +74,10 @@ OPENAI_TRANSCRIBE_MODEL = os.getenv("OPENAI_TRANSCRIBE_MODEL", "whisper-1")
 if not TOKEN:
     raise ValueError("错误：未找到 TELEGRAM_BOT_TOKEN，请检查 .env 文件！")
 
-if not OWNER_ID:
-    raise ValueError("错误：未配置 OWNER_ID。当前版本仅支持单一授权用户，请在 .env 中设置 OWNER_ID。")
+if REQUIRE_AUTH and not OWNER_ID and not ALLOWED_USER_IDS and not ADMIN_USER_IDS:
+    logger.error("访问控制已启用，但未配置 OWNER_ID / ALLOWED_USER_IDS / ADMIN_USER_IDS，所有访问将被拒绝。")
+elif not REQUIRE_AUTH and not OWNER_ID and not ALLOWED_USER_IDS:
+    logger.warning("未配置 OWNER_ID 或 ALLOWED_USER_IDS，且 REQUIRE_AUTH=false，将允许所有用户访问。")
 
 # 根据选择的提供者验证 API Key
 if LLM_PROVIDER == "gemini" and not GEMINI_API_KEY:
@@ -83,6 +97,30 @@ GLOBAL_CONTEXT_MAX_CHARS = _env_int("GLOBAL_CONTEXT_MAX_CHARS", 10000)  # 注入
 TIMEZONE = "Asia/Shanghai"  # 时区
 TIDYING_DRY_RUN = os.getenv("TIDYING_DRY_RUN", "false").lower() == "true"
 RAPID_MESSAGE_BUFFER_SECONDS = float(os.getenv("RAPID_MESSAGE_BUFFER_SECONDS", "2.5"))  # 聊天快速连发缓冲窗口
+LLM_MAX_TOOL_CALLS = _env_int("LLM_MAX_TOOL_CALLS", 10)
+GEMINI_TEMPERATURE = float(os.getenv("GEMINI_TEMPERATURE", "0.7"))
+LOGIC_KEYWORDS = [
+    "规划", "计划", "安排", "整理", "复盘", "反思", "分析", "schedule", "plan"
+]
+
+TELEGRAM_MAX_MESSAGE_LENGTH = _env_int("TELEGRAM_MAX_MESSAGE_LENGTH", 4096)
+TELEGRAM_TYPING_INTERVAL = float(os.getenv("TELEGRAM_TYPING_INTERVAL", "3.0"))
+TELEGRAM_ALLOWED_AUDIO_MIME = _env_list("TELEGRAM_ALLOWED_AUDIO_MIME") or [
+    "audio/ogg",
+    "audio/webm",
+    "audio/wav",
+    "audio/flac",
+    "audio/mp3",
+    "audio/mpeg",
+]
+
+WEATHER_TIMEOUT_SECONDS = float(os.getenv("WEATHER_TIMEOUT_SECONDS", "8"))
+HOLIDAY_TIMEOUT_SECONDS = float(os.getenv("HOLIDAY_TIMEOUT_SECONDS", "8"))
+
+DEFAULT_VISIBLE_FILES = ["routine.json", "plan.md", "user_profile.md", "current_goals.md"]
+
+SCHEDULER_MISFIRE_GRACE_SECONDS = _env_int("SCHEDULER_MISFIRE_GRACE_SECONDS", 60)
+SCHEDULER_COALESCE = os.getenv("SCHEDULER_COALESCE", "true").lower() == "true"
 
 # --- 模型配置（兼容旧代码，实际从上方配置读取）---
 SMART_MODEL = GEMINI_SMART_MODEL if LLM_PROVIDER == "gemini" else OPENAI_SMART_MODEL

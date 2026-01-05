@@ -1,4 +1,4 @@
-# [ID] 标题（简短、明确）
+﻿# [ID] 标题（简短、明确）
 
 - 日期:
 - 状态: draft / active / verified

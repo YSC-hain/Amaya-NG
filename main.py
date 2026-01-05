@@ -45,8 +45,8 @@ if __name__ == "__main__":
     # 设置 coalesce=True 合并多次错过的执行为一次
     scheduler = AsyncIOScheduler(
         job_defaults={
-            'misfire_grace_time': 60,
-            'coalesce': True
+            'misfire_grace_time': config.SCHEDULER_MISFIRE_GRACE_SECONDS,
+            'coalesce': config.SCHEDULER_COALESCE
         }
     )
 
