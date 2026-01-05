@@ -7,6 +7,7 @@ import logging
 from typing import Optional, List, Tuple
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.helpers import escape_markdown
 from telegram.ext import (
     ApplicationBuilder,
     ContextTypes,
@@ -87,6 +88,10 @@ async def _send_with_fallback(message, text: str, parse_mode: str = "Markdown"):
                 await message.reply_text(chunk)
             except TelegramError as e:
                 logger.error(f"消息分段 {i+1}/{len(chunks)} 发送失败: {e}")
+
+
+def _escape_markdown(text: Optional[str]) -> str:
+    return escape_markdown(text or "", version=1)
 
 
 # --- 权限控制 ---
@@ -314,10 +319,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     user_id = resolve_user_id("telegram", str(chat_id), user.first_name)
     logger.info(f"User {user.first_name} started the bot. Chat ID: {chat_id}")
-    await update.message.reply_text(
-        f"你好，{user.first_name}。\n我是 Amaya 原型机。\nID: `{chat_id}`\nUID: `{user_id}`",
-        parse_mode="Markdown",
-    )
+    safe_name = _escape_markdown(user.first_name)
+    safe_chat_id = _escape_markdown(str(chat_id))
+    safe_user_id = _escape_markdown(str(user_id))
+    message = f"你好，{safe_name}。\n我是 Amaya 原型机。\nID: `{safe_chat_id}`\nUID: `{safe_user_id}`"
+    await _send_with_fallback(update.message, message)
 
 
 async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -349,7 +355,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "\"10????????\"\n"
         "\"????8?????\""
     )  # ToDo
-    await update.message.reply_text(help_text, parse_mode="Markdown")
+    await _send_with_fallback(update.message, help_text)
 
 
 async def whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -358,11 +364,13 @@ async def whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(UNAUTHORIZED_TEXT)
         return
     user_id = lookup_user_id("telegram", str(chat_id))
+    safe_chat_id = _escape_markdown(str(chat_id))
     if user_id:
-        text = f"chat_id: `{chat_id}`\nuser_id: `{user_id}`"
+        safe_user_id = _escape_markdown(str(user_id))
+        text = f"chat_id: `{safe_chat_id}`\nuser_id: `{safe_user_id}`"
     else:
-        text = f"chat_id: `{chat_id}`\n???? user_id?"
-    await update.message.reply_text(text, parse_mode="Markdown")
+        text = f"chat_id: `{safe_chat_id}`\n???? user_id?"
+    await _send_with_fallback(update.message, text)
 
 
 async def user_create(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -372,10 +380,11 @@ async def user_create(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     display_name = " ".join(context.args).strip() or None
     user_id = create_user(display_name)
-    message = f"??????\nuser_id: `{user_id}`"
+    safe_user_id = _escape_markdown(str(user_id))
+    message = f"??????\nuser_id: `{safe_user_id}`"
     if display_name:
-        message += f"\nname: {display_name}"
-    await update.message.reply_text(message, parse_mode="Markdown")
+        message += f"\nname: {_escape_markdown(display_name)}"
+    await _send_with_fallback(update.message, message)
 
 
 async def user_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
