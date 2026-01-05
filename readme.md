@@ -58,6 +58,7 @@
 
 ## 记忆系统概览
 - **记忆库文件**：`data/memory_bank/<user_id>/` 下的 Markdown/JSON。
+- **写入触发**：仅在调用 `save_memory` 工具成功后落盘；若未触发工具或失败，目录可能为空。
 - **默认可见文件**：`routine.json`, `plan.md`, `user_profile.md`, `current_goals.md`。
 - **课表源文件（可选）**：`course_schedule.md`，用于生成未来 2-3 天的日程。
 - **Pinned 文件**：由 `meta` 表记录，拼接进全局上下文。
@@ -84,4 +85,4 @@
 ## 交互指南
 - **日常对话**: 像朋友一样聊天。
 - **设置提醒**: "10分钟后提醒我喝水" 或 "明天早上8点叫醒我"。
-- **记忆管理**: "记住我的车牌号是..." (Amaya 会自动存入文件)。
+- **记忆管理**: "记住我的车牌号是..." (Amaya 会在 `save_memory` 成功后写入 `data/memory_bank/<user_id>/`)。

@@ -3,16 +3,40 @@ import json
 import os
 import logging
 import sqlite3
-import threading
 import re
 from datetime import datetime, timedelta, date
 import time
 from typing import Any, Optional, List
 import config
 from utils.user_context import get_current_user_id
+from utils.db import get_db_connection, get_db_lock, DB_PATH
+# 用户管理函数（从 user_storage 导入并重新导出，保持向后兼容）
+from utils.user_storage import (
+    lookup_user_id,
+    create_user,
+    link_user_mapping,
+    list_users,
+    list_user_mappings,
+    resolve_user_id,
+    get_external_id,
+)
+# 记忆文件系统函数（从 memory_storage 导入并重新导出，保持向后兼容）
+from utils.memory_storage import (
+    get_user_memory_dir as _get_user_memory_dir,
+    list_files_in_memory,
+    read_file_content,
+    write_file_content,
+    delete_file as _delete_file_impl,
+    _safe_user_id,
+    DATA_DIR,
+)
 
 logger = logging.getLogger("Amaya.Storage")
 event_logger = logging.getLogger("Amaya.EventBus")
+
+# 兼容旧代码的别名
+_db_lock = get_db_lock()
+_get_db_connection = get_db_connection
 
 
 def build_reminder_id(run_at: float) -> str:
@@ -28,299 +52,8 @@ DATA_DIR = "data/memory_bank"
 os.makedirs(DATA_DIR, exist_ok=True)
 SCHEDULE_FILE = "routine.json"
 
-# --- SQLite 存储 ---
-DB_PATH = config.DB_PATH
-db_dir = os.path.dirname(DB_PATH)
-if db_dir:
-    os.makedirs(db_dir, exist_ok=True)
-_db_lock = threading.Lock()
-
-
-def _get_db_connection() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH, timeout=30)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-
-def _init_db() -> None:
-    with _db_lock, _get_db_connection() as conn:
-        conn.execute("PRAGMA journal_mode=WAL;")
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                user_id TEXT PRIMARY KEY,
-                display_name TEXT,
-                created_at REAL NOT NULL
-            )
-        """)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS user_mappings (
-                platform TEXT NOT NULL,
-                external_id TEXT NOT NULL,
-                user_id TEXT NOT NULL,
-                created_at REAL NOT NULL,
-                PRIMARY KEY (platform, external_id)
-            )
-        """)
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_user_mappings_user ON user_mappings(user_id)")
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS meta (
-                user_id TEXT NOT NULL,
-                key TEXT NOT NULL,
-                value TEXT NOT NULL,
-                PRIMARY KEY (user_id, key)
-            )
-        """)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS pending_reminders (
-                id TEXT PRIMARY KEY,
-                user_id TEXT NOT NULL,
-                run_at REAL NOT NULL,
-                prompt TEXT NOT NULL
-            )
-        """)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS short_term_memory (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id TEXT NOT NULL,
-                role TEXT NOT NULL,
-                text TEXT NOT NULL,
-                timestamp REAL NOT NULL
-            )
-        """)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS sys_events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id TEXT NOT NULL,
-                event_id TEXT,
-                event_type TEXT,
-                payload TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'pending',
-                created_at REAL NOT NULL,
-                processed_at REAL
-            )
-        """)
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_sys_events_status ON sys_events(status)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_sys_events_type ON sys_events(event_type)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_sys_events_user ON sys_events(user_id)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_pending_reminders_user ON pending_reminders(user_id)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_memory_user ON short_term_memory(user_id)")
-
-# --- 用户映射 ---
-def _create_user_id(conn: sqlite3.Connection) -> str:
-    row = conn.execute(
-        """
-        SELECT user_id
-        FROM users
-        WHERE user_id GLOB '[0-9]*'
-          AND user_id NOT GLOB '*[^0-9]*'
-          AND length(user_id) <= 6
-        ORDER BY CAST(user_id AS INTEGER) DESC
-        LIMIT 1
-        """
-    ).fetchone()
-    next_id = 1 if not row else int(row["user_id"]) + 1
-    if next_id > 999999:
-        raise ValueError("User id sequence exhausted (max 6 digits)")
-    return f"{next_id:06d}"
-
-
-def lookup_user_id(platform: str, external_id: str) -> Optional[str]:
-    platform = (platform or "").strip().lower()
-    external_id = str(external_id or "").strip()
-    if not platform or not external_id:
-        return None
-    try:
-        with _db_lock, _get_db_connection() as conn:
-            row = conn.execute(
-                "SELECT user_id FROM user_mappings WHERE platform = ? AND external_id = ?",
-                (platform, external_id)
-            ).fetchone()
-    except sqlite3.Error as e:
-        logger.error(f"User mapping lookup failed: {e}")
-        return None
-    return row["user_id"] if row else None
-
-
-def create_user(display_name: Optional[str] = None, user_id: Optional[str] = None) -> Optional[str]:
-    now = time.time()
-    try:
-        with _db_lock, _get_db_connection() as conn:
-            resolved_user_id = user_id or _create_user_id(conn)
-            row = conn.execute(
-                "SELECT user_id FROM users WHERE user_id = ?",
-                (resolved_user_id,)
-            ).fetchone()
-            if not row:
-                conn.execute(
-                    "INSERT INTO users (user_id, display_name, created_at) VALUES (?, ?, ?)",
-                    (resolved_user_id, display_name, now)
-                )
-            elif display_name:
-                conn.execute(
-                    "UPDATE users SET display_name = ? WHERE user_id = ?",
-                    (display_name, resolved_user_id)
-                )
-            return resolved_user_id
-    except (sqlite3.Error, ValueError) as e:
-        logger.error(f"Create user failed: {e}")
-        return None
-
-
-def link_user_mapping(
-    platform: str,
-    external_id: str,
-    user_id: str,
-    display_name: Optional[str] = None,
-    force: bool = False
-) -> bool:
-    platform = (platform or "").strip().lower()
-    external_id = str(external_id or "").strip()
-    if not platform or not external_id or not user_id:
-        return False
-    now = time.time()
-    try:
-        with _db_lock, _get_db_connection() as conn:
-            row = conn.execute(
-                "SELECT user_id FROM user_mappings WHERE platform = ? AND external_id = ?",
-                (platform, external_id)
-            ).fetchone()
-            if row and row["user_id"] != user_id and not force:
-                return False
-
-            existing_user = conn.execute(
-                "SELECT user_id FROM users WHERE user_id = ?",
-                (user_id,)
-            ).fetchone()
-            if not existing_user:
-                conn.execute(
-                    "INSERT INTO users (user_id, display_name, created_at) VALUES (?, ?, ?)",
-                    (user_id, display_name, now)
-                )
-            elif display_name:
-                conn.execute(
-                    "UPDATE users SET display_name = ? WHERE user_id = ?",
-                    (display_name, user_id)
-                )
-
-            if row:
-                conn.execute(
-                    "UPDATE user_mappings SET user_id = ? WHERE platform = ? AND external_id = ?",
-                    (user_id, platform, external_id)
-                )
-            else:
-                conn.execute(
-                    "INSERT INTO user_mappings (platform, external_id, user_id, created_at) VALUES (?, ?, ?, ?)",
-                    (platform, external_id, user_id, now)
-                )
-    except sqlite3.Error as e:
-        logger.error(f"Link user mapping failed: {e}")
-        return False
-    return True
-
-
-def list_users() -> list[dict]:
-    try:
-        with _db_lock, _get_db_connection() as conn:
-            rows = conn.execute(
-                "SELECT user_id, display_name, created_at FROM users ORDER BY created_at"
-            ).fetchall()
-    except sqlite3.Error as e:
-        logger.error(f"List users failed: {e}")
-        return []
-    return [
-        {
-            "user_id": row["user_id"],
-            "display_name": row["display_name"],
-            "created_at": row["created_at"],
-        }
-        for row in rows
-    ]
-
-
-def list_user_mappings(platform: Optional[str] = None) -> list[dict]:
-    platform = (platform or "").strip().lower()
-    try:
-        with _db_lock, _get_db_connection() as conn:
-            if platform:
-                rows = conn.execute(
-                    "SELECT platform, external_id, user_id, created_at FROM user_mappings WHERE platform = ?",
-                    (platform,)
-                ).fetchall()
-            else:
-                rows = conn.execute(
-                    "SELECT platform, external_id, user_id, created_at FROM user_mappings"
-                ).fetchall()
-    except sqlite3.Error as e:
-        logger.error(f"List user mappings failed: {e}")
-        return []
-    return [
-        {
-            "platform": row["platform"],
-            "external_id": row["external_id"],
-            "user_id": row["user_id"],
-            "created_at": row["created_at"],
-        }
-        for row in rows
-    ]
-
-
-def resolve_user_id(platform: str, external_id: str, display_name: Optional[str] = None) -> str:
-    """
-    获取或创建内部 user_id。
-    platform: 例如 "telegram"
-    external_id: 平台侧用户标识（如 chat_id）
-    """
-    platform = (platform or "").strip().lower()
-    external_id = str(external_id or "").strip()
-    if not platform or not external_id:
-        return config.DEFAULT_USER_ID
-
-    with _db_lock, _get_db_connection() as conn:
-        try:
-            row = conn.execute(
-                "SELECT user_id FROM user_mappings WHERE platform = ? AND external_id = ?",
-                (platform, external_id)
-            ).fetchone()
-            if row:
-                user_id = row["user_id"]
-                if display_name:
-                    conn.execute(
-                        "UPDATE users SET display_name = ? WHERE user_id = ?",
-                        (display_name, user_id)
-                    )
-                return user_id
-
-            user_id = _create_user_id(conn)
-            now = time.time()
-            conn.execute(
-                "INSERT INTO users (user_id, display_name, created_at) VALUES (?, ?, ?)",
-                (user_id, display_name, now)
-            )
-            conn.execute(
-                "INSERT INTO user_mappings (platform, external_id, user_id, created_at) VALUES (?, ?, ?, ?)",
-                (platform, external_id, user_id, now)
-            )
-            logger.info("已创建新用户映射 platform=%s external_id=%s user_id=%s", platform, external_id, user_id)
-            return user_id
-        except (sqlite3.Error, ValueError) as e:
-            logger.error(f"用户映射失败: {e}")
-            return config.DEFAULT_USER_ID
-
-
-def get_external_id(user_id: str, platform: str) -> Optional[str]:
-    platform = (platform or "").strip().lower()
-    if not platform or not user_id:
-        return None
-    try:
-        with _db_lock, _get_db_connection() as conn:
-            row = conn.execute(
-                "SELECT external_id FROM user_mappings WHERE platform = ? AND user_id = ?",
-                (platform, user_id)
-            ).fetchone()
-    except sqlite3.Error as e:
-        logger.error(f"读取用户映射失败: {e}")
-        return None
-    return row["external_id"] if row else None
+# 注意：数据库初始化已移至 utils/db.py，导入时自动完成
+# 注意：用户管理函数已移至 utils/user_storage.py，通过顶部导入重新导出
 
 # --- 通用文件读写 ---
 def _load_meta(default: Optional[Any] = None, user_id: Optional[str] = None) -> Any:
@@ -485,58 +218,12 @@ def save_json(file_key: str, data: Any, user_id: Optional[str] = None) -> bool:
     logger.error(f"未知的 file_key: {file_key}")
     return False
 
-# --- Amaya 记忆文件系统 API ---
-def _safe_user_id(user_id: str) -> str:
-    return re.sub(r"[^a-zA-Z0-9_-]", "_", user_id or config.DEFAULT_USER_ID)
+# 注意：记忆文件系统函数 (list_files_in_memory, read_file_content, write_file_content)
+# 已移至 utils/memory_storage.py，通过顶部导入重新导出
 
+# --- 日程表存储 ---
+SCHEDULE_FILE = "routine.json"
 
-def _get_user_memory_dir(user_id: Optional[str] = None) -> str:
-    resolved_user_id = _safe_user_id(user_id or get_current_user_id())
-    path = os.path.join(DATA_DIR, resolved_user_id)
-    os.makedirs(path, exist_ok=True)
-    return path
-
-
-def list_files_in_memory(user_id: Optional[str] = None) -> List[str]:
-    """列出所有记忆文件"""
-    try:
-        dir_path = _get_user_memory_dir(user_id)
-        return [f for f in os.listdir(dir_path) if not f.startswith('.')]
-    except OSError as e:
-        logger.error(f"列出记忆文件失败: {e}")
-        return []
-
-def read_file_content(filename: str, user_id: Optional[str] = None) -> Optional[str]:
-    """读取记忆库中的文件内容"""
-    dir_path = _get_user_memory_dir(user_id)
-    path = os.path.join(dir_path, os.path.basename(filename)) # 安全处理
-    if not os.path.exists(path):
-        return None
-    try:
-        with open(path, 'r', encoding='utf-8') as f:
-            return f.read()
-    except IOError as e:
-        logger.error(f"读取文件 {filename} 失败: {e}")
-        return None
-    except Exception as e:
-        logger.exception(f"读取文件 {filename} 异常: {e}")
-        return None
-
-def write_file_content(filename: str, content: str, user_id: Optional[str] = None) -> bool:
-    """写入/覆盖记忆库中的文件内容"""
-    dir_path = _get_user_memory_dir(user_id)
-    path = os.path.join(dir_path, os.path.basename(filename))
-    try:
-        with open(path, 'w', encoding='utf-8') as f:
-            f.write(content)
-        logger.debug(f"已写入文件: {filename}")
-        return True
-    except IOError as e:
-        logger.error(f"写入文件 {filename} 失败: {e}")
-        return False
-    except Exception as e:
-        logger.exception(f"写入文件 {filename} 时发生未知错误: {e}")
-        return False
 
 def _default_schedule() -> dict:
     return {
@@ -650,6 +337,10 @@ def _time_to_minutes(time_str: str) -> Optional[int]:
     return value.hour * 60 + value.minute
 
 
+# 别名，供 tools.py 使用统一命名
+_parse_schedule_time = _time_to_minutes
+
+
 def _sort_schedule_items(items: list[dict]) -> list[dict]:
     def _key(item: dict) -> tuple:
         start = _time_to_minutes(item.get("start", ""))
@@ -726,15 +417,16 @@ def get_schedule_summary(
         return "=== DAILY SCHEDULE ===\n- (暂无安排)"
     return "\n".join(lines)
 
+
 def delete_file(filename, user_id: Optional[str] = None):
-    """删除记忆库中的文件"""
-    dir_path = _get_user_memory_dir(user_id)
-    path = os.path.join(dir_path, os.path.basename(filename))
-    if os.path.exists(path):
-        os.remove(path)
+    """删除记忆库中的文件（并清理 pin 状态）"""
+    # 使用 memory_storage 的基础实现
+    success = _delete_file_impl(filename, user_id)
+    if success:
+        # 同时清理 pin 状态
         toggle_pin_status(filename, pin=False, user_id=user_id)
-        return True
-    return False
+    return success
+
 
 # --- 置顶 (Pin) 逻辑 ---
 def toggle_pin_status(filename, pin: bool, user_id: Optional[str] = None):
@@ -922,5 +614,4 @@ def read_events_from_bus() -> tuple[list[dict], list[str]]:
     event_logger.debug("事件总线读取完成 events=%s invalid=%s", len(events), len(invalid_lines))
     return events, invalid_lines
 
-
-_init_db()
+# 注意：_init_db() 已在 utils/db.py 导入时自动调用

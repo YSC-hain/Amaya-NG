@@ -17,7 +17,11 @@ from utils.storage import (
     load_schedule,
     save_schedule,
     build_schedule_item_id,
-    get_schedule_summary
+    get_schedule_summary,
+    # 日程表解析函数（统一从 storage 导入，避免重复定义）
+    _parse_schedule_date,
+    _parse_schedule_time,
+    _sort_schedule_items,
 )
 from utils.user_context import get_current_user_id
 
@@ -183,21 +187,7 @@ def clear_reminder(reminder_id: str) -> str:
 
 
 # --- 3. 结构化日程表工具 ---
-def _parse_schedule_date(date_str: str) -> Optional[datetime.date]:
-    try:
-        return datetime.datetime.strptime(date_str, "%Y-%m-%d").date()
-    except (TypeError, ValueError):
-        return None
-
-
-def _parse_schedule_time(time_str: str) -> Optional[int]:
-    if not time_str:
-        return None
-    try:
-        value = datetime.datetime.strptime(time_str, "%H:%M")
-    except (TypeError, ValueError):
-        return None
-    return value.hour * 60 + value.minute
+# _parse_schedule_date, _parse_schedule_time, _sort_schedule_items 已从 storage.py 导入
 
 
 def _normalize_tags(tags: Optional[List[str]]) -> list[str]:
@@ -221,11 +211,7 @@ def _get_schedule_day(schedule: dict, date_str: str, create: bool = False) -> Op
     return None
 
 
-def _sort_schedule_items(items: list[dict]) -> list[dict]:
-    def _key(item: dict) -> tuple:
-        start = _parse_schedule_time(item.get("start", ""))
-        return (start if start is not None else 24 * 60 + 1, item.get("title", ""))
-    return sorted(items, key=_key)
+# _sort_schedule_items 已从 storage.py 导入
 
 
 def _find_schedule_conflicts(items: list[dict], start: int, end: int, ignore_id: Optional[str] = None) -> list[dict]:

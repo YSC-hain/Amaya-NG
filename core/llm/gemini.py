@@ -4,6 +4,7 @@ Gemini LLM Provider 实现
 """
 
 import logging
+import inspect
 import io
 import json
 import time
@@ -46,6 +47,102 @@ def _serialize_history(messages: List[ChatMessage]) -> list[dict]:
             "timestamp": msg.timestamp
         })
     return result
+
+
+def _build_function_declaration(client: genai.Client, func: Callable) -> types.FunctionDeclaration:
+    from_callable = types.FunctionDeclaration.from_callable
+    try:
+        signature = inspect.signature(from_callable)
+    except (TypeError, ValueError):
+        return from_callable(func)
+
+    if "client" in signature.parameters:
+        api_client = getattr(client, "_api_client", None)
+        if api_client is None:
+            raise RuntimeError("Gemini client missing _api_client for tool declaration.")
+        return from_callable(client=api_client, callable=func)
+
+    if "callable" in signature.parameters:
+        return from_callable(callable=func)
+
+    return from_callable(func)
+
+
+def _normalize_tool_args(value: object) -> object:
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    if isinstance(value, dict):
+        return {k: _normalize_tool_args(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_normalize_tool_args(v) for v in value]
+    return value
+
+
+def _extract_function_calls(response: types.GenerateContentResponse) -> list[types.FunctionCall]:
+    calls: list[types.FunctionCall] = []
+    if not response.candidates or not response.candidates[0].content:
+        return calls
+    parts = response.candidates[0].content.parts or []
+    for part in parts:
+        if part.function_call:
+            calls.append(part.function_call)
+    return calls
+
+
+def _get_response_text(response: types.GenerateContentResponse) -> str:
+    if not response.candidates or not response.candidates[0].content:
+        return ""
+    parts = response.candidates[0].content.parts or []
+    text = ""
+    for part in parts:
+        if hasattr(part, "text") and part.text and not getattr(part, 'thought', False):
+            text += part.text
+    return text
+
+
+def _build_tool_summary(tool_trace: list[dict]) -> str:
+    """根据工具调用记录生成简洁的摘要回复"""
+    if not tool_trace:
+        return ""
+    successful = [t for t in tool_trace if t.get("success")]
+    if not successful:
+        return ""
+
+    summaries = []
+    for call in successful:
+        name = call.get("name", "")
+        output = call.get("output", "")
+        # 根据工具类型生成友好摘要
+        if name == "schedule_reminder":
+            # 从输出中提取时间信息
+            if "计划" in output and "执行" in output:
+                summaries.append(f"✓ {output.split('：', 1)[-1].strip() if '：' in output else '提醒已设置'}")
+            else:
+                summaries.append("✓ 提醒已设置")
+        elif name == "save_memory":
+            summaries.append(f"✓ 已保存到文件")
+        elif name == "add_schedule_item":
+            summaries.append("✓ 日程已添加")
+        elif name.startswith("update_") or name.startswith("move_"):
+            summaries.append("✓ 日程已更新")
+        elif name.startswith("remove_") or name.startswith("clear_"):
+            summaries.append("✓ 已删除")
+        else:
+            # 通用处理
+            summaries.append(f"✓ {name} 完成")
+
+    return "\n".join(summaries) if summaries else ""
+
+
+def _execute_tool_call(name: str, args: dict, tool_map: dict[str, Callable]) -> tuple[bool, str]:
+    if not name or name not in tool_map:
+        return False, f"Error: Unknown function {name}"
+    try:
+        result = tool_map[name](**args)
+        return True, str(result)
+    except Exception as e:
+        logger.error(f"Gemini tool execution failed {name}: {e}")
+        return False, f"Error executing {name}: {str(e)}"
 
 
 class GeminiProvider(LLMProvider):
@@ -142,6 +239,8 @@ class GeminiProvider(LLMProvider):
                 "tools": [func.__name__ for func in tools] if tools else [],
             }
 
+        tool_call_trace: list[dict] = []
+
         def _emit_full_payload(success: bool, response_text: str = "", error_message: str = "") -> None:
             if not log_full_payload:
                 return
@@ -153,6 +252,7 @@ class GeminiProvider(LLMProvider):
                 "model": model_name,
                 "use_smart": use_smart_model,
                 "request": request_payload,
+                "tool_calls": tool_call_trace,
                 "response": {
                     "success": success,
                     "text": response_text,
@@ -173,13 +273,22 @@ class GeminiProvider(LLMProvider):
                 "temperature": config.GEMINI_TEMPERATURE,
             }
 
-            # 只有当有工具时才添加工具配置
+            tool_map: dict[str, Callable] = {}
             if tools:
-                config_kwargs["tools"] = tools
-                config_kwargs["automatic_function_calling"] = types.AutomaticFunctionCallingConfig(
-                    disable=False,
-                    maximum_remote_calls=max_tool_calls
-                )
+                tool_map = {func.__name__: func for func in tools}
+                tool_declarations = []
+                for func in tools:
+                    try:
+                        tool_declarations.append(_build_function_declaration(self.client, func))
+                    except Exception as e:
+                        logger.warning("Gemini tool declaration failed: %s", e)
+                if tool_declarations:
+                    config_kwargs["tools"] = [types.Tool(function_declarations=tool_declarations)]
+                    config_kwargs["tool_config"] = types.ToolConfig(
+                        function_calling_config=types.FunctionCallingConfig(
+                            mode=types.FunctionCallingConfigMode.AUTO
+                        )
+                    )
 
             preview_text = _truncate_for_log(multimodal_input.text if multimodal_input else "")
             logger.info(
@@ -207,18 +316,87 @@ class GeminiProvider(LLMProvider):
             else:
                 message_input = ""  # 空消息（不应该发生）
 
-            # 发送消息
             response = chat_session.send_message(message_input)
 
-            # 提取响应文本
+            tool_call_count = 0
             response_text = ""
-            if response.candidates and response.candidates[0].content.parts:
-                for part in response.candidates[0].content.parts:
-                    if hasattr(part, 'text') and part.text and not getattr(part, 'thought', False):
-                        response_text += part.text
+            while tool_call_count < max_tool_calls:
+                function_calls = _extract_function_calls(response)
+                if not function_calls:
+                    response_text = _get_response_text(response)
+                    break
+
+                response_parts: list[types.Part] = []
+                for call in function_calls:
+                    if tool_call_count >= max_tool_calls:
+                        break
+                    name = call.name or ""
+                    args = call.args or {}
+                    if isinstance(args, str):
+                        try:
+                            args = json.loads(args)
+                        except json.JSONDecodeError:
+                            args = {}
+                    if isinstance(args, dict):
+                        args = _normalize_tool_args(args)
+                    else:
+                        args = {}
+                    success, result = _execute_tool_call(name, args, tool_map)
+                    tool_call_trace.append({
+                        "name": name,
+                        "arguments": args,
+                        "output": result,
+                        "success": success
+                    })
+                    response_parts.append(
+                        types.Part(
+                            function_response=types.FunctionResponse(
+                                id=call.id,
+                                name=name,
+                                response={"result": result} if success else {"error": result}
+                            )
+                        )
+                    )
+                    tool_call_count += 1
+                    logger.info(
+                        "Gemini tool call #%s name=%s success=%s output_preview=\"%s\"",
+                        tool_call_count,
+                        name,
+                        success,
+                        _truncate_for_log(result, 200),
+                    )
+
+                if not response_parts:
+                    response_text = _get_response_text(response)
+                    break
+
+                try:
+                    response = chat_session.send_message(response_parts)
+                except genai.errors.APIError as tool_response_error:
+                    # 工具调用后 Gemini 返回空响应（thinking model 可能只有 thought 无文本）
+                    error_str = str(tool_response_error)
+                    if "empty response" in error_str or "no meaningful content" in error_str:
+                        logger.warning(
+                            "Gemini 工具响应后返回空内容，使用工具摘要作为回复: %s",
+                            _truncate_for_log(error_str, 100)
+                        )
+                        tool_summary = _build_tool_summary(tool_call_trace)
+                        if tool_summary:
+                            response_text = tool_summary
+                            break
+                    # 其他 API 错误继续抛出
+                    raise
+
+            if not response_text:
+                response_text = _get_response_text(response)
 
             if not response_text.strip():
-                response_text = "抱歉，我暂时无法回应。"
+                # 如果仍然为空但有成功的工具调用，使用工具摘要
+                tool_summary = _build_tool_summary(tool_call_trace)
+                if tool_summary:
+                    response_text = tool_summary
+                else:
+                    response_text = "抱歉，我暂时无法回应。"
 
             elapsed = time.time() - start_time
             logger.info(
