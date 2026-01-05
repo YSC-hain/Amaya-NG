@@ -359,11 +359,9 @@ async def whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     user_id = lookup_user_id("telegram", str(chat_id))
     if user_id:
-        text = f"chat_id: `{chat_id}`
-user_id: `{user_id}`"
+        text = f"chat_id: `{chat_id}`\nuser_id: `{user_id}`"
     else:
-        text = f"chat_id: `{chat_id}`
-???? user_id?"
+        text = f"chat_id: `{chat_id}`\n???? user_id?"
     await update.message.reply_text(text, parse_mode="Markdown")
 
 
@@ -374,11 +372,9 @@ async def user_create(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     display_name = " ".join(context.args).strip() or None
     user_id = create_user(display_name)
-    message = f"??????
-user_id: `{user_id}`"
+    message = f"??????\nuser_id: `{user_id}`"
     if display_name:
-        message += f"
-name: {display_name}"
+        message += f"\nname: {display_name}"
     await update.message.reply_text(message, parse_mode="Markdown")
 
 
@@ -514,12 +510,12 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logger.error(f"图片处理失败: {e}")
             response_text = "抱歉，图片处理失败，请重试。"
-    finally:
-        stop_event.set()
-        try:
-            await asyncio.wait_for(spinner, timeout=1.0)
-        except asyncio.TimeoutError:
-            spinner.cancel()
+        finally:
+            stop_event.set()
+            try:
+                await asyncio.wait_for(spinner, timeout=1.0)
+            except asyncio.TimeoutError:
+                spinner.cancel()
 
     if response_text:
         await _send_with_fallback(update.message, response_text)
@@ -575,12 +571,12 @@ async def voice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logger.error(f"语音处理失败: {e}")
             response_text = "抱歉，语音处理失败，请重试。"
-    finally:
-        stop_event.set()
-        try:
-            await asyncio.wait_for(spinner, timeout=1.0)
-        except asyncio.TimeoutError:
-            spinner.cancel()
+        finally:
+            stop_event.set()
+            try:
+                await asyncio.wait_for(spinner, timeout=1.0)
+            except asyncio.TimeoutError:
+                spinner.cancel()
 
     if response_text:
         await _send_with_fallback(update.message, response_text)
