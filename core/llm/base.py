@@ -103,6 +103,18 @@ class LLMProvider(ABC):
         """获取当前使用的模型名称"""
         pass
 
+    def transcribe_audio(
+        self,
+        audio_bytes: bytes,
+        audio_mime: str,
+        model: Optional[str] = None
+    ) -> Optional[str]:
+        """
+        可选：将音频转为文本。
+        默认返回 None，表示该 Provider 不支持转写。
+        """
+        return None
+
     @property
     @abstractmethod
     def provider_name(self) -> str:

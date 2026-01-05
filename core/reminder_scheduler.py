@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 
 from core.agent import amaya
 from utils.storage import load_json, save_json, build_reminder_id, read_events_from_bus
+from utils.logging_setup import request_context
 import config
 
 if TYPE_CHECKING:
@@ -144,14 +145,15 @@ class ReminderScheduler:
 
     async def execute_reminder(self, prompt, job_id):
         """[回调] 当闹钟时间到时，此函数被触发"""
-        logger.info(f"触发提醒任务: {prompt}")
+        with request_context() as request_id:
+            logger.info(f"触发提醒任务: {prompt}")
 
-        # 生成提醒消息
-        system_trigger = f"[SYSTEM_EVENT] 提醒时间已到。原定计划是：'{prompt}'。请根据此指令，并结合当前记忆，生成一条提醒信息。"
-        response = await amaya.chat(system_trigger)
+            # 生成提醒消息
+            system_trigger = f"[SYSTEM_EVENT] 提醒时间已到。原定计划是：'{prompt}'。请根据此指令，并结合当前记忆，生成一条提醒信息。"
+            response = await amaya.chat(system_trigger, request_id=request_id)
 
-        # 通过抽象接口发送消息
-        await self.sender.send_text(response)
+            # 通过抽象接口发送消息
+            await self.sender.send_text(response)
 
-        self.update_pending_reminders(job_id, 0, "", remove=True)
-        logger.info(f"任务 {job_id} 已完成并从持久化记录中移除。")
+            self.update_pending_reminders(job_id, 0, "", remove=True)
+            logger.info(f"任务 {job_id} 已完成并从持久化记录中移除。")

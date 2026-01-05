@@ -8,6 +8,34 @@ load_dotenv()
 
 logger = logging.getLogger("Amaya.Config")
 
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, default))
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_log_level(name: str, default: int) -> int:
+    raw = os.getenv(name, "")
+    if not raw:
+        return default
+    value = getattr(logging, raw.upper(), None)
+    return value if isinstance(value, int) else default
+
+
+LOG_DIR = os.getenv("LOG_DIR", "data/logs")
+LOG_LEVEL = _env_log_level("LOG_LEVEL", logging.INFO)
+LIBRARY_LOG_LEVEL = _env_log_level("LIBRARY_LOG_LEVEL", logging.WARNING)
+LOG_RETENTION_DAYS = _env_int("LOG_RETENTION_DAYS", _env_int("LOG_BACKUP_COUNT", 7))
+LOG_MAX_BYTES = _env_int("LOG_MAX_BYTES", 0)
+LOG_PAYLOAD_MAX_BYTES = _env_int("LOG_PAYLOAD_MAX_BYTES", LOG_MAX_BYTES)
+LOG_LLM_PAYLOADS = os.getenv("LOG_LLM_PAYLOADS", "preview").lower()
+if LOG_LLM_PAYLOADS not in ("preview", "full", "off"):
+    LOG_LLM_PAYLOADS = "preview"
+LOG_BACKUP_COUNT = LOG_RETENTION_DAYS
+
+DB_PATH = os.getenv("AMAYA_DB_PATH", os.path.join("data", "amaya.db"))
+
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 OWNER_ID = os.getenv("OWNER_ID")
 
@@ -50,13 +78,6 @@ elif LLM_PROVIDER not in ("gemini", "openai"):
 EVENT_BUS_CHECK_INTERVAL = 5  # 事件总线检查间隔（秒）
 MAINTENANCE_INTERVAL_HOURS = 8  # 自动整理间隔（小时）
 SHORT_TERM_MEMORY_TTL = 10800  # 短期记忆过期时间（秒）
-# 短期记忆条数与上下文长度可通过环境变量调节，避免在生产与开发环境写死
-def _env_int(name: str, default: int) -> int:
-    try:
-        return int(os.getenv(name, default))
-    except (TypeError, ValueError):
-        return default
-
 SHORT_TERM_MEMORY_MAX_ENTRIES = _env_int("SHORT_TERM_MEMORY_MAX_ENTRIES", 80)  # 超出后从旧到新截断
 GLOBAL_CONTEXT_MAX_CHARS = _env_int("GLOBAL_CONTEXT_MAX_CHARS", 10000)  # 注入到 prompt 的全局上下文最大字符数，超出将截断
 TIMEZONE = "Asia/Shanghai"  # 时区

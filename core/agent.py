@@ -12,7 +12,7 @@ import config
 from core.llm import create_llm_provider, ChatMessage, MultimodalInput
 from core.tools import tools_registry
 from utils.storage import get_global_context_string, load_json, save_json
-from openai import OpenAI
+from utils.logging_setup import request_context
 
 logger = logging.getLogger("Amaya.Agent")
 
@@ -88,28 +88,6 @@ class AmayaBrain:
         self._save_short_term_memory()
         logger.info("Amaya 状态已保存")
 
-    def _transcribe_audio_openai(self, audio_bytes: bytes, audio_mime: str) -> str | None:
-        """
-        使用 OpenAI Whisper 将音频转为文本。
-        转写失败返回 None，不抛异常到上层。
-        """
-        try:
-            client_kwargs = {"api_key": config.OPENAI_API_KEY}
-            if config.OPENAI_API_BASE:
-                client_kwargs["base_url"] = config.OPENAI_API_BASE
-            client = OpenAI(**client_kwargs)
-            # whisper-1 需要文件名，随机构造
-            file_tuple = ("speech." + (audio_mime.split("/")[-1] or "ogg"), audio_bytes, audio_mime)
-            resp = client.audio.transcriptions.create(
-                model=config.OPENAI_TRANSCRIBE_MODEL,
-                file=file_tuple,
-            )
-            text = getattr(resp, "text", "") or ""
-            return text.strip() or None
-        except Exception as e:
-            logger.warning(f"音频转写失败: {e}")
-            return None
-
     def _get_cleaned_history(self) -> list[ChatMessage]:
         """剔除过期的历史记录，返回 ChatMessage 列表"""
         cutoff = time.time() - config.SHORT_TERM_MEMORY_TTL
@@ -132,37 +110,54 @@ class AmayaBrain:
         now = datetime.now()
         return f"Current Time: {now.strftime('%Y-%m-%d %A %H:%M')}"
 
-    def chat_sync(self, user_text: str, image_bytes: bytes = b'', audio_bytes: bytes = b'', audio_mime: str = "audio/ogg") -> str:
+    def chat_sync(
+        self,
+        user_text: str,
+        image_bytes: bytes = b'',
+        audio_bytes: bytes = b'',
+        audio_mime: str = "audio/ogg",
+        request_id: str | None = None
+    ) -> str:
         """
         同步版本的 chat 方法，用于在线程池中执行。
         这样可以避免阻塞主事件循环，让 typing 指示器正常工作。
         """
-        # 动态选择模型
-        # 如果涉及规划、反思、大量文件操作，切换到 Smart 模型
-        logic_keywords = ["规划", "计划", "安排", "整理", "复盘", "反思", "分析", "schedule", "plan"]
-        use_smart = (image_bytes or audio_bytes) or any(k in user_text for k in logic_keywords)
-        start_time = time.time()
-        selected_model = self.llm.get_model_name(use_smart)
+        with request_context(request_id):
+            # 动态选择模型
+            # 如果涉及规划、反思、大量文件操作，切换到 Smart 模型
+            logic_keywords = ["规划", "计划", "安排", "整理", "复盘", "反思", "分析", "schedule", "plan"]
+            use_smart = (image_bytes or audio_bytes) or any(k in user_text for k in logic_keywords)
+            start_time = time.time()
+            selected_model = self.llm.get_model_name(use_smart)
 
-        try:
-            # 1. 获取上下文
-            global_context = get_global_context_string()
+            try:
+                # 1. 获取上下文
+                global_context = get_global_context_string()
 
-            # 获取并清理短期对话历史
-            history = self._get_cleaned_history()
+                # 获取并清理短期对话历史
+                history = self._get_cleaned_history()
+                logger.debug(
+                    "上下文准备完成 history=%s global_context_chars=%s",
+                    len(history),
+                    len(global_context),
+                )
 
-            # OpenAI provider: 先尝试语音转文字（whisper），转写失败则提示
-            if audio_bytes and self.llm.provider_name == "openai":
-                transcript = self._transcribe_audio_openai(audio_bytes, audio_mime)
-                if transcript:
-                    user_text = f"[语音转写] {transcript}"
-                    audio_bytes = b""  # 避免继续传递无效音频
-                else:
-                    logger.warning("当前提供者不支持直接处理语音且转写失败，已提示用户。")
-                    return "当前模型暂不支持直接处理语音，且自动转写失败，请发送文字或先将语音转成文字后再发送。"
+                # OpenAI provider: 先尝试语音转文字（whisper），转写失败则提示
+                if audio_bytes and self.llm.provider_name == "openai":
+                    transcript = self.llm.transcribe_audio(
+                        audio_bytes,
+                        audio_mime,
+                        model=config.OPENAI_TRANSCRIBE_MODEL
+                    )
+                    if transcript:
+                        user_text = f"[语音转写] {transcript}"
+                        audio_bytes = b""  # 避免继续传递无效音频
+                    else:
+                        logger.warning("当前提供者不支持直接处理语音且转写失败，已提示用户。")
+                        return "当前模型暂不支持直接处理语音，且自动转写失败，请发送文字或先将语音转成文字后再发送。"
 
-            # 2. 构造 Prompt，把记忆强行塞进上下文
-            full_input = f"""
+                # 2. 构造 Prompt，把记忆强行塞进上下文
+                full_input = f"""
 [WORLD CONTEXT]
 {global_context}
 
@@ -173,71 +168,78 @@ class AmayaBrain:
 {user_text}
 """
 
-            # 3. 构造多模态输入
-            multimodal_input = MultimodalInput(
-                text=full_input,
-                image_bytes=image_bytes,
-                audio_bytes=audio_bytes,
-                audio_mime=audio_mime
-            )
+                # 3. 构造多模态输入
+                multimodal_input = MultimodalInput(
+                    text=full_input,
+                    image_bytes=image_bytes,
+                    audio_bytes=audio_bytes,
+                    audio_mime=audio_mime
+                )
 
-            # 4. 调用 LLM
-            logger.info(
-                "LLM 调用开始 provider=%s model=%s use_smart=%s has_image=%s has_audio=%s text_len=%s",
-                self.llm.provider_name,
-                selected_model,
-                use_smart,
-                bool(image_bytes),
-                bool(audio_bytes),
-                len(user_text),
-            )
-            response = self.llm.chat(
-                messages=history,
-                system_instruction=self.system_instruction,
-                multimodal_input=multimodal_input,
-                tools=tools_registry,
-                use_smart_model=use_smart,
-                max_tool_calls=10
-            )
+                # 4. 调用 LLM
+                logger.info(
+                    "LLM 调用开始 provider=%s model=%s use_smart=%s has_image=%s has_audio=%s text_len=%s",
+                    self.llm.provider_name,
+                    selected_model,
+                    use_smart,
+                    bool(image_bytes),
+                    bool(audio_bytes),
+                    len(user_text),
+                )
+                response = self.llm.chat(
+                    messages=history,
+                    system_instruction=self.system_instruction,
+                    multimodal_input=multimodal_input,
+                    tools=tools_registry,
+                    use_smart_model=use_smart,
+                    max_tool_calls=10
+                )
 
-            response_text = response.text
+                response_text = response.text
 
-            # 确保不返回空字符串
-            if not response_text.strip():
-                response_text = "抱歉，我暂时无法回应。"
+                # 确保不返回空字符串
+                if not response_text.strip():
+                    response_text = "抱歉，我暂时无法回应。"
 
-            # 更新短期记忆库
-            current_time = time.time()
-            self.short_term_memory.append({"role": "user", "text": user_text, "timestamp": current_time})
-            self.short_term_memory.append({"role": "model", "text": response_text, "timestamp": current_time})
+                # 更新短期记忆库
+                current_time = time.time()
+                self.short_term_memory.append({"role": "user", "text": user_text, "timestamp": current_time})
+                self.short_term_memory.append({"role": "model", "text": response_text, "timestamp": current_time})
 
-            # 保存短期记忆
-            self._save_short_term_memory()
+                # 保存短期记忆
+                self._save_short_term_memory()
 
-            elapsed = time.time() - start_time
-            logger.info(
-                "LLM 调用完成 provider=%s model=%s use_smart=%s elapsed_sec=%.3f response_len=%s",
-                self.llm.provider_name,
-                selected_model,
-                use_smart,
-                elapsed,
-                len(response_text),
-            )
+                elapsed = time.time() - start_time
+                logger.info(
+                    "LLM 调用完成 provider=%s model=%s use_smart=%s elapsed_sec=%.3f response_len=%s",
+                    self.llm.provider_name,
+                    selected_model,
+                    use_smart,
+                    elapsed,
+                    len(response_text),
+                )
 
-            return response_text
+                return response_text
 
-        except Exception as e:
-            logger.exception(f"Amaya 核心逻辑异常: {e}")
-            return f"处理请求时发生错误: {type(e).__name__}"
+            except Exception as e:
+                logger.exception(f"Amaya 核心逻辑异常: {e}")
+                return f"处理请求时发生错误: {type(e).__name__}"
 
-    async def chat(self, user_text: str, image_bytes: bytes = b'', audio_bytes: bytes = b'', audio_mime: str = "audio/ogg") -> str:
+    async def chat(
+        self,
+        user_text: str,
+        image_bytes: bytes = b'',
+        audio_bytes: bytes = b'',
+        audio_mime: str = "audio/ogg",
+        request_id: str | None = None
+    ) -> str:
         """
         异步版本的 chat 方法，内部调用 chat_sync。
         保留此方法以保持向后兼容性（如 tidying_up 等内部调用）。
         """
         import asyncio
         return await asyncio.to_thread(
-            self.chat_sync, user_text, image_bytes, audio_bytes, audio_mime
+            self.chat_sync, user_text, image_bytes, audio_bytes, audio_mime, request_id
         )
 
     async def tidying_up(self):
@@ -246,39 +248,40 @@ class AmayaBrain:
         这是你的"潜意识整理时间"。
         不接收用户输入，而是自我反思文件结构。
         """
-        try:
-            logger.info("Amaya 正在进行自主整理...")
-            context = get_global_context_string()
-            maintenance_prompt = f"""
+        with request_context():
+            try:
+                logger.info("Amaya 正在进行自主整理...")
+                context = get_global_context_string()
+                maintenance_prompt = f"""
 [System Maintenance Mode]
 Context:
 {context}
 """
-            # 使用独立的 chat session（无历史记录）避免上下文污染
-            multimodal_input = MultimodalInput(text=maintenance_prompt)
+                # 使用独立的 chat session（无历史记录）避免上下文污染
+                multimodal_input = MultimodalInput(text=maintenance_prompt)
 
-            # Dry-run 模式下不允许工具调用，避免自修改风险
-            tools = [] if config.TIDYING_DRY_RUN else tools_registry
-            response = self.llm.chat(
-                messages=[],  # 无历史记录
-                system_instruction=self.system_instruction + self.maintenance_instruction,
-                multimodal_input=multimodal_input,
-                tools=tools,
-                use_smart_model=True,
-                max_tool_calls=10
-            )
+                # Dry-run 模式下不允许工具调用，避免自修改风险
+                tools = [] if config.TIDYING_DRY_RUN else tools_registry
+                response = self.llm.chat(
+                    messages=[],  # 无历史记录
+                    system_instruction=self.system_instruction + self.maintenance_instruction,
+                    multimodal_input=multimodal_input,
+                    tools=tools,
+                    use_smart_model=True,
+                    max_tool_calls=10
+                )
 
-            response_text = response.text
-            if not response_text:
-                response_text = "System clean."
-            if config.TIDYING_DRY_RUN:
-                response_text = f"[Dry-run，无文件修改] {response_text}"
+                response_text = response.text
+                if not response_text:
+                    response_text = "System clean."
+                if config.TIDYING_DRY_RUN:
+                    response_text = f"[Dry-run，无文件修改] {response_text}"
 
-            return f"整理报告: {response_text}"
+                return f"整理报告: {response_text}"
 
-        except Exception as e:
-            logger.exception(f"整理任务异常: {e}")
-            return f"整理失败: {type(e).__name__}: {str(e)}"
+            except Exception as e:
+                logger.exception(f"整理任务异常: {e}")
+                return f"整理失败: {type(e).__name__}: {str(e)}"
 
 
 amaya = AmayaBrain()

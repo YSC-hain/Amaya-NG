@@ -5,12 +5,16 @@ Gemini LLM Provider 实现
 
 import logging
 import io
+import json
+import time
 from typing import List, Optional, Callable
 
 import PIL.Image
 from google import genai
 from google.genai import types
 
+import config
+from utils.logging_setup import get_request_id
 from core.llm.base import (
     LLMProvider,
     ChatMessage,
@@ -20,6 +24,27 @@ from core.llm.base import (
 )
 
 logger = logging.getLogger("Amaya.LLM.Gemini")
+payload_logger = logging.getLogger("Amaya.LLM.Payload")
+
+
+def _truncate_for_log(text: str, max_length: int = 300) -> str:
+    """限制日志中的文本长度，避免打印过长或包含敏感内容。"""
+    if not text:
+        return ""
+    clean = text.replace("\n", " ")
+    return clean[:max_length] + ("..." if len(clean) > max_length else "")
+
+
+def _serialize_history(messages: List[ChatMessage]) -> list[dict]:
+    """序列化历史消息，供完整日志或调试使用。"""
+    result = []
+    for msg in messages:
+        result.append({
+            "role": msg.role.value,
+            "text": msg.text,
+            "timestamp": msg.timestamp
+        })
+    return result
 
 
 class GeminiProvider(LLMProvider):
@@ -99,8 +124,42 @@ class GeminiProvider(LLMProvider):
         max_tool_calls: int = 10
     ) -> ChatResponse:
         """发送消息并获取响应"""
+        log_full_payload = config.LOG_LLM_PAYLOADS == "full"
+        request_id = get_request_id()
+        model_name = self.get_model_name(use_smart_model)
+        request_payload = None
+        if log_full_payload:
+            request_payload = {
+                "system_instruction": system_instruction,
+                "history": _serialize_history(messages),
+                "input_text": multimodal_input.text if multimodal_input else "",
+                "has_image": bool(multimodal_input.image_bytes) if multimodal_input else False,
+                "has_audio": bool(multimodal_input.audio_bytes) if multimodal_input else False,
+                "image_bytes_len": len(multimodal_input.image_bytes) if multimodal_input else 0,
+                "audio_bytes_len": len(multimodal_input.audio_bytes) if multimodal_input else 0,
+                "tools": [func.__name__ for func in tools] if tools else [],
+            }
+
+        def _emit_full_payload(success: bool, response_text: str = "", error_message: str = "") -> None:
+            if not log_full_payload:
+                return
+            payload = {
+                "timestamp": time.time(),
+                "request_id": request_id,
+                "provider": self.provider_name,
+                "model": model_name,
+                "use_smart": use_smart_model,
+                "request": request_payload,
+                "response": {
+                    "success": success,
+                    "text": response_text,
+                    "error_message": error_message,
+                }
+            }
+            payload_logger.info(json.dumps(payload, ensure_ascii=False))
+
         try:
-            model_name = self.get_model_name(use_smart_model)
+            start_time = time.time()
 
             # 转换历史记录格式
             history = self._convert_history_to_gemini_format(messages)
@@ -118,6 +177,18 @@ class GeminiProvider(LLMProvider):
                     disable=False,
                     maximum_remote_calls=max_tool_calls
                 )
+
+            preview_text = _truncate_for_log(multimodal_input.text if multimodal_input else "")
+            logger.info(
+                "Gemini chat 请求: model=%s use_smart=%s history=%s tools=%s has_image=%s has_audio=%s input_preview=\"%s\"",
+                model_name,
+                use_smart_model,
+                len(messages),
+                [func.__name__ for func in tools] if tools else [],
+                bool(multimodal_input.image_bytes) if multimodal_input else False,
+                bool(multimodal_input.audio_bytes) if multimodal_input else False,
+                preview_text,
+            )
 
             # 创建 chat session
             chat_session = self.client.chats.create(
@@ -146,6 +217,17 @@ class GeminiProvider(LLMProvider):
             if not response_text.strip():
                 response_text = "抱歉，我暂时无法回应。"
 
+            elapsed = time.time() - start_time
+            logger.info(
+                "Gemini chat 完成 model=%s use_smart=%s elapsed_sec=%.3f response_preview=\"%s\"",
+                model_name,
+                use_smart_model,
+                elapsed,
+                _truncate_for_log(response_text, 400),
+            )
+
+            _emit_full_payload(True, response_text=response_text)
+
             return ChatResponse(
                 text=response_text,
                 success=True,
@@ -155,6 +237,7 @@ class GeminiProvider(LLMProvider):
         except genai.errors.APIError as e:
             error_msg = e.message if hasattr(e, 'message') else str(e)
             logger.error(f"Gemini API 错误: {error_msg}")
+            _emit_full_payload(False, error_message=error_msg)
             return ChatResponse(
                 text=f"API 调用失败，请稍后重试。错误: {error_msg}",
                 success=False,
@@ -162,6 +245,7 @@ class GeminiProvider(LLMProvider):
             )
         except PIL.UnidentifiedImageError as e:
             logger.warning(f"图片格式无法识别: {e}")
+            _emit_full_payload(False, error_message=str(e))
             return ChatResponse(
                 text="抱歉，无法识别这张图片的格式。",
                 success=False,
@@ -169,6 +253,7 @@ class GeminiProvider(LLMProvider):
             )
         except Exception as e:
             logger.exception(f"Gemini Provider 异常: {e}")
+            _emit_full_payload(False, error_message=str(e))
             return ChatResponse(
                 text=f"处理请求时发生错误: {type(e).__name__}",
                 success=False,

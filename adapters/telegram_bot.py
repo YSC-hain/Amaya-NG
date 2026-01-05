@@ -21,6 +21,7 @@ import config
 from adapters.base import MessageSender
 from core.agent import amaya
 from utils.storage import get_pending_reminders_summary
+from utils.logging_setup import request_context
 
 logger = logging.getLogger("Amaya.Telegram")
 
@@ -151,12 +152,12 @@ class ChatSessionBuffer:
     def __init__(self, chat_id: int, buffer_seconds: float = RAPID_MESSAGE_BUFFER_SECONDS):
         self.chat_id = chat_id
         self.buffer_seconds = buffer_seconds
-        self.queue: List[Tuple[str, object]] = []
+        self.queue: List[Tuple[str, object, str]] = []
         self.processing = False
         self.new_message_event = asyncio.Event()
 
-    def enqueue(self, user_text: str, message_obj) -> None:
-        self.queue.append((user_text, message_obj))
+    def enqueue(self, user_text: str, message_obj, request_id: str) -> None:
+        self.queue.append((user_text, message_obj, request_id))
         self.new_message_event.set()
 
     async def process(self, context: ContextTypes.DEFAULT_TYPE):
@@ -191,17 +192,31 @@ class ChatSessionBuffer:
                 self.new_message_event.clear()
 
                 responses: List[Tuple[str, str]] = []
-                for user_text, message_obj in batch:
-                    try:
-                        resp = await asyncio.to_thread(amaya.chat_sync, user_text)
-                    except Exception as e:
-                        logger.error(f"聊天处理异常: {e}")
-                        resp = "抱歉，处理消息时发生错误，请稍后重试。"
+                for user_text, message_obj, request_id in batch:
+                    with request_context(request_id):
+                        try:
+                            logger.info(
+                                "处理文本消息 chat_id=%s len=%s",
+                                self.chat_id,
+                                len(user_text or ""),
+                            )
+                            resp = await asyncio.to_thread(
+                                amaya.chat_sync, user_text, request_id=request_id
+                            )
+                        except Exception as e:
+                            logger.error(f"聊天处理异常: {e}")
+                            resp = "抱歉，处理消息时发生错误，请稍后重试。"
                     responses.append((user_text, resp))
 
                 combined = _format_batch_response(responses)
                 target_message = batch[-1][1]
                 await _send_with_fallback(target_message, combined)
+                logger.info(
+                    "批处理回复已发送 chat_id=%s messages=%s response_len=%s",
+                    self.chat_id,
+                    len(responses),
+                    len(combined),
+                )
 
                 # 短暂停顿，观察是否有新的消息进入队列
                 try:
@@ -340,8 +355,10 @@ async def chat_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("未授权。仅限 OWNER 使用。")
         return
 
-    session = CHAT_BUFFERS.setdefault(chat_id, ChatSessionBuffer(chat_id))
-    session.enqueue(user_text, update.message)
+    with request_context() as request_id:
+        logger.info("收到文本消息 chat_id=%s len=%s", chat_id, len(user_text or ""))
+        session = CHAT_BUFFERS.setdefault(chat_id, ChatSessionBuffer(chat_id))
+        session.enqueue(user_text, update.message, request_id)
 
     # 独立任务处理队列，允许新的消息快速返回（合并后统一回复）
     if not session.processing:
@@ -359,18 +376,28 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await asyncio.sleep(0)  # 让出控制权
 
     response_text = None
-    try:
-        photo = update.message.photo[-1]
-        file = await context.bot.get_file(photo.file_id)
-        image_bytes = await file.download_as_bytearray()
-        caption = update.message.caption or "用户发来了一张图片"
-        # 使用 to_thread 在线程池中运行阻塞的 Gemini 调用
-        response_text = await asyncio.to_thread(
-            amaya.chat_sync, caption, image_bytes=bytes(image_bytes)
-        )
-    except Exception as e:
-        logger.error(f"图片处理失败: {e}")
-        response_text = "抱歉，图片处理失败，请重试。"
+    with request_context() as request_id:
+        try:
+            photo = update.message.photo[-1]
+            file = await context.bot.get_file(photo.file_id)
+            image_bytes = await file.download_as_bytearray()
+            caption = update.message.caption or "用户发来了一张图片"
+            logger.info(
+                "收到图片消息 chat_id=%s caption_len=%s image_bytes=%s",
+                chat_id,
+                len(caption or ""),
+                len(image_bytes),
+            )
+            # 使用 to_thread 在线程池中运行阻塞的 Gemini 调用
+            response_text = await asyncio.to_thread(
+                amaya.chat_sync,
+                caption,
+                image_bytes=bytes(image_bytes),
+                request_id=request_id,
+            )
+        except Exception as e:
+            logger.error(f"图片处理失败: {e}")
+            response_text = "抱歉，图片处理失败，请重试。"
     finally:
         stop_event.set()
         try:
@@ -399,25 +426,36 @@ async def voice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await asyncio.sleep(0)  # 让出控制权
 
     response_text = None
-    try:
-        file = await context.bot.get_file(voice.file_id)
-        audio_bytes = await file.download_as_bytearray()
-        mime_type = getattr(voice, "mime_type", None) or "audio/ogg"
-        audio_bytes, mime_type = _ensure_supported_audio(bytes(audio_bytes), mime_type)
-        if audio_bytes is None:
-            await update.message.reply_text("当前语音格式不受支持，请以 OGG/OPUS/WEBM/WAV 重新发送。")
-        else:
-            user_hint = "[语音消息] 用户发来了一段语音，请结合上下文提炼关键内容进行回应。"
-            # 使用 to_thread 在线程池中运行阻塞的 Gemini 调用
-            response_text = await asyncio.to_thread(
-                amaya.chat_sync, user_hint, audio_bytes=audio_bytes, audio_mime=mime_type
-            )
-    except TelegramError as e:
-        logger.error(f"语音下载失败: {e}")
-        await update.message.reply_text(f"下载语音失败: {e}")
-    except Exception as e:
-        logger.error(f"语音处理失败: {e}")
-        response_text = "抱歉，语音处理失败，请重试。"
+    with request_context() as request_id:
+        try:
+            file = await context.bot.get_file(voice.file_id)
+            audio_bytes = await file.download_as_bytearray()
+            mime_type = getattr(voice, "mime_type", None) or "audio/ogg"
+            audio_bytes, mime_type = _ensure_supported_audio(bytes(audio_bytes), mime_type)
+            if audio_bytes is None:
+                await update.message.reply_text("当前语音格式不受支持，请以 OGG/OPUS/WEBM/WAV 重新发送。")
+            else:
+                logger.info(
+                    "收到语音消息 chat_id=%s mime=%s audio_bytes=%s",
+                    chat_id,
+                    mime_type,
+                    len(audio_bytes),
+                )
+                user_hint = "[语音消息] 用户发来了一段语音，请结合上下文提炼关键内容进行回应。"
+                # 使用 to_thread 在线程池中运行阻塞的 Gemini 调用
+                response_text = await asyncio.to_thread(
+                    amaya.chat_sync,
+                    user_hint,
+                    audio_bytes=audio_bytes,
+                    audio_mime=mime_type,
+                    request_id=request_id,
+                )
+        except TelegramError as e:
+            logger.error(f"语音下载失败: {e}")
+            await update.message.reply_text(f"下载语音失败: {e}")
+        except Exception as e:
+            logger.error(f"语音处理失败: {e}")
+            response_text = "抱歉，语音处理失败，请重试。"
     finally:
         stop_event.set()
         try:

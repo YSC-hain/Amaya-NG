@@ -7,8 +7,11 @@ OpenAI LLM Provider 实现
 import base64
 import json
 import logging
+import time
 from typing import List, Optional, Callable, Any, get_type_hints
 
+import config
+from utils.logging_setup import get_request_id
 from openai import OpenAI
 from openai import APIError, APIConnectionError, RateLimitError
 
@@ -21,6 +24,60 @@ from core.llm.base import (
 )
 
 logger = logging.getLogger("Amaya.LLM.OpenAI")
+payload_logger = logging.getLogger("Amaya.LLM.Payload")
+
+
+def _truncate_for_log(text: str, max_length: int = 300) -> str:
+    """限制日志中的文本长度，避免打印过长或包含敏感内容。"""
+    if not text:
+        return ""
+    clean = text.replace("\n", " ")
+    return clean[:max_length] + ("..." if len(clean) > max_length else "")
+
+
+def _summarize_arguments(arguments: Any) -> str:
+    """仅记录工具参数的形状，不输出具体内容。"""
+    if isinstance(arguments, dict):
+        return f"dict_keys={list(arguments.keys())}"
+    return f"type={type(arguments).__name__}"
+
+
+def _sanitize_value(value: Any, max_length: int = 120) -> Any:
+    """对日志中的参数进行脱敏与截断，避免输出大块数据或二进制。"""
+    if isinstance(value, bytes):
+        return f"<bytes:{len(value)}>"
+    if isinstance(value, str):
+        clean = value.replace("\n", " ")
+        return clean[:max_length] + ("..." if len(clean) > max_length else "")
+    if isinstance(value, (int, float, bool)) or value is None:
+        return value
+    if isinstance(value, list):
+        return [_sanitize_value(v, max_length) for v in value[:20]]  # 控制长度
+    if isinstance(value, dict):
+        return {k: _sanitize_value(v, max_length) for k, v in list(value.items())[:20]}
+    return str(value)
+
+
+def _format_arguments_for_log(arguments: Any, max_length: int = 300) -> str:
+    """序列化工具参数供日志使用，保证单行且长度受控。"""
+    try:
+        sanitized = _sanitize_value(arguments)
+        text = json.dumps(sanitized, ensure_ascii=False)
+    except Exception:
+        text = _summarize_arguments(arguments)
+    return _truncate_for_log(text, max_length)
+
+
+def _serialize_history(messages: List[ChatMessage]) -> list[dict]:
+    """序列化历史消息，供完整日志或调试使用。"""
+    result = []
+    for msg in messages:
+        result.append({
+            "role": msg.role.value,
+            "text": msg.text,
+            "timestamp": msg.timestamp
+        })
+    return result
 
 
 def _python_type_to_json_schema(py_type: Any) -> dict:
@@ -150,6 +207,28 @@ class OpenAIProvider(LLMProvider):
     def get_model_name(self, use_smart: bool = False) -> str:
         return self.smart_model if use_smart else self.fast_model
 
+    def transcribe_audio(
+        self,
+        audio_bytes: bytes,
+        audio_mime: str,
+        model: Optional[str] = None
+    ) -> Optional[str]:
+        """使用 OpenAI Whisper 将音频转为文本。"""
+        if not audio_bytes:
+            return None
+        model_name = model or "whisper-1"
+        try:
+            file_tuple = ("speech." + (audio_mime.split("/")[-1] or "ogg"), audio_bytes, audio_mime)
+            resp = self.client.audio.transcriptions.create(
+                model=model_name,
+                file=file_tuple,
+            )
+            text = getattr(resp, "text", "") or ""
+            return text.strip() or None
+        except Exception as e:
+            logger.warning(f"音频转写失败 model={model_name}: {e}")
+            return None
+
     def _convert_history_to_openai_format(
         self,
         messages: List[ChatMessage],
@@ -225,11 +304,60 @@ class OpenAIProvider(LLMProvider):
         - fast 模式：不启用 reasoning
         - 两种模式都支持 tools
         """
+        log_full_payload = config.LOG_LLM_PAYLOADS == "full"
+        request_id = get_request_id()
+        model_name = self.get_model_name(use_smart_model)
+        request_payload = None
+        if log_full_payload:
+            request_payload = {
+                "system_instruction": system_instruction,
+                "history": _serialize_history(messages),
+                "input_text": multimodal_input.text if multimodal_input else "",
+                "has_image": bool(multimodal_input.image_bytes) if multimodal_input else False,
+                "has_audio": bool(multimodal_input.audio_bytes) if multimodal_input else False,
+                "image_bytes_len": len(multimodal_input.image_bytes) if multimodal_input else 0,
+                "audio_bytes_len": len(multimodal_input.audio_bytes) if multimodal_input else 0,
+                "tools": [func.__name__ for func in tools] if tools else [],
+            }
+
+        tool_call_trace: list[dict] = []
+
+        def _emit_full_payload(success: bool, response_text: str = "", error_message: str = "") -> None:
+            if not log_full_payload:
+                return
+            payload = {
+                "timestamp": time.time(),
+                "request_id": request_id,
+                "provider": self.provider_name,
+                "model": model_name,
+                "use_smart": use_smart_model,
+                "request": request_payload,
+                "tool_calls": tool_call_trace,
+                "response": {
+                    "success": success,
+                    "text": response_text,
+                    "error_message": error_message,
+                }
+            }
+            payload_logger.info(json.dumps(payload, ensure_ascii=False))
+
         try:
-            model_name = self.get_model_name(use_smart_model)
 
             # 转换历史记录格式
             openai_messages = self._convert_history_to_openai_format(messages, system_instruction)
+
+            # 日志记录请求概要，避免泄露图片或长文本
+            preview_text = _truncate_for_log(multimodal_input.text if multimodal_input else "")
+            logger.info(
+                "OpenAI chat 请求: model=%s use_smart=%s history=%s tools=%s has_image=%s has_audio=%s input_preview=\"%s\"",
+                model_name,
+                use_smart_model,
+                len(messages),
+                [func.__name__ for func in tools] if tools else [],
+                bool(multimodal_input.image_bytes) if multimodal_input else False,
+                bool(multimodal_input.audio_bytes) if multimodal_input else False,
+                preview_text,
+            )
 
             # 添加当前用户输入
             if multimodal_input:
@@ -338,14 +466,37 @@ class OpenAIProvider(LLMProvider):
                         "output": result
                     })
 
+                    tool_call_trace.append({
+                        "call_id": tc["call_id"],
+                        "name": tc["name"],
+                        "arguments": tc["arguments"],
+                        "output": result
+                    })
+
                     tool_call_count += 1
-                    logger.debug(f"工具调用 [{tool_call_count}]: {tc['name']}")
+                    logger.info(
+                        "工具调用完成 #%s name=%s params=%s output_preview=\"%s\"",
+                        tool_call_count,
+                        tc["name"],
+                        _format_arguments_for_log(tc["arguments"]),
+                        _truncate_for_log(str(result), 200)
+                    )
 
             # 提取最终响应
             response_text = final_text or getattr(response, "output_text", "") or ""
 
             if not response_text.strip():
                 response_text = "抱歉，我暂时无法回应。"
+
+            logger.info(
+                "OpenAI chat 完成 model=%s use_smart=%s tool_calls=%s response_preview=\"%s\"",
+                model_name,
+                use_smart_model,
+                tool_call_count,
+                _truncate_for_log(response_text, 400)
+            )
+
+            _emit_full_payload(True, response_text=response_text)
 
             return ChatResponse(
                 text=response_text,
@@ -355,6 +506,7 @@ class OpenAIProvider(LLMProvider):
 
         except APIConnectionError as e:
             logger.error(f"OpenAI API 连接错误: {e}")
+            _emit_full_payload(False, error_message=str(e))
             return ChatResponse(
                 text="API 连接失败，请检查网络或 Base URL 配置。",
                 success=False,
@@ -362,6 +514,7 @@ class OpenAIProvider(LLMProvider):
             )
         except RateLimitError as e:
             logger.error(f"OpenAI API 限流: {e}")
+            _emit_full_payload(False, error_message=str(e))
             return ChatResponse(
                 text="API 调用频率过高，请稍后重试。",
                 success=False,
@@ -369,6 +522,7 @@ class OpenAIProvider(LLMProvider):
             )
         except APIError as e:
             logger.error(f"OpenAI API 错误: {e}")
+            _emit_full_payload(False, error_message=str(e))
             return ChatResponse(
                 text=f"API 调用失败，请稍后重试。错误: {str(e)}",
                 success=False,
@@ -376,6 +530,7 @@ class OpenAIProvider(LLMProvider):
             )
         except Exception as e:
             logger.exception(f"OpenAI Provider 异常: {e}")
+            _emit_full_payload(False, error_message=str(e))
             return ChatResponse(
                 text=f"处理请求时发生错误: {type(e).__name__}",
                 success=False,

@@ -15,10 +15,20 @@ from adapters.telegram_bot import build_application, register_handlers, Telegram
 from utils.logging_setup import setup_logging, set_library_log_levels
 
 # --- 设置日志 ---
-log_path = setup_logging()
-set_library_log_levels()
+log_path = setup_logging(
+    log_dir=config.LOG_DIR,
+    level=config.LOG_LEVEL,
+    retention_days=config.LOG_RETENTION_DAYS,
+    max_bytes=config.LOG_MAX_BYTES,
+    payload_max_bytes=config.LOG_PAYLOAD_MAX_BYTES,
+)
+set_library_log_levels(level=config.LIBRARY_LOG_LEVEL)
 logger = logging.getLogger("Amaya")
-logger.info(f"日志初始化完成，输出路径: {log_path}")
+logger.info(
+    "日志初始化完成 level=%s path=%s",
+    logging.getLevelName(config.LOG_LEVEL),
+    log_path,
+)
 
 
 # --- 维护任务 ---
