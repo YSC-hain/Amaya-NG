@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "lists": [
+    { "id": "inbox", "name": "Inbox", "groups": [] },
+    { "id": "nowTask", "name": "NowTask", "groups": [] },
+    { "id": "next_action", "name": "Next Action", "groups": [] },
+    { "id": "someday", "name": "Someday", "groups": [] },
+    { "id": "waiting", "name": "Waiting", "groups": [] },
+    { "id": "routine", "name": "Routine", "groups": [] },
+    { "id": "checklist", "name": "Checklist", "groups": [] }
+  ]
+}

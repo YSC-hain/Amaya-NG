@@ -1,0 +1,13 @@
+[project]
+name = "amaya-ng"
+version = "0.1.0"
+description = "Amaya-NG single-user companion planning system"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "python-telegram-bot==22.5",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
